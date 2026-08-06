@@ -3,8 +3,12 @@
 //! Connect to a hub (hub-lite / hub-pro), host post/stream API endpoints,
 //! register apps, and call API through the hub.
 //!
-//! Lite port: no auth, no keychain, no crypto. The wire contract matches the
-//! TS reference: `hub/profile/update`, `hub/service/update` on every
+//! Hub-pro auth (TS keychain parity): the service loads-or-generates the
+//! ed25519 `auth` key file in the cwd and attaches a freshly signed
+//! `key.<pub>.<sig>.<expiry>` token as the raw `auth: ...\r\nv: 0\r\n`
+//! header block on EVERY (re)connect (hub-lite ignores the headers entirely,
+//! so the port stays regression-safe). The wire contract matches the TS
+//! reference: `hub/profile/update`, `hub/service/update` on every
 //! (re)connect, AppInterface + element DSL.
 
 use serde::Serialize;
@@ -13,14 +17,25 @@ use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fmt;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
 pub use channel_rs::*;
 
+mod keychain;
+pub use keychain::{Keychain, KeychainError};
+
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const POLL_SLEEP: Duration = Duration::from_millis(1);
+
+/// The raw header block attached to the WebSocket upgrade request on every
+/// (re)connect: `auth: <fresh token>` + `v: 0` (channel-rs appends the final
+/// CRLF itself; keeping ours makes the block self-contained).
+pub fn auth_header_block(token: &str) -> String {
+    format!("auth: {token}\r\nv: 0\r\n")
+}
 
 // ---------------------------------------------------------------------------
 // Options & address
@@ -34,7 +49,7 @@ pub enum Address {
 }
 
 /// Options for [`Service::new`]. All fields optional.
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct ServiceOptions {
     /// Port (u16) or `ws://` URL. Default: `1997`, or `$HUB` when set.
     pub address: Option<Address>,
@@ -42,6 +57,33 @@ pub struct ServiceOptions {
     pub name: Option<String>,
     /// Profile icon: a string or `{"symbol": ..., "text": ...}`.
     pub icon: Option<Value>,
+    /// Optional token factory for hub-pro auth (default: the keychain `auth`
+    /// file in the cwd, TS parity). The returned token is attached as the
+    /// raw `auth` header on every (re)connect; an empty string connects
+    /// without auth headers (e.g. the default keychain failed to load).
+    pub sign: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+}
+
+impl fmt::Debug for ServiceOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceOptions")
+            .field("address", &self.address)
+            .field("name", &self.name)
+            .field("icon", &self.icon)
+            .field("sign", &self.sign.as_ref().map(|_| "<closure>"))
+            .finish()
+    }
+}
+
+impl Clone for ServiceOptions {
+    fn clone(&self) -> Self {
+        Self {
+            address: self.address.clone(),
+            name: self.name.clone(),
+            icon: self.icon.clone(),
+            sign: self.sign.clone(),
+        }
+    }
 }
 
 fn resolve_address(options: &ServiceOptions) -> Address {
@@ -439,6 +481,7 @@ enum Request {
 pub struct Service {
     address: Address,
     profile: Option<Profile>,
+    sign: Option<Arc<dyn Fn() -> String + Send + Sync>>,
     apps: Vec<AppHeader>,
     paths: BTreeSet<String>,
     settings: HashMap<String, ApiSettings>,
@@ -460,9 +503,23 @@ impl Service {
         } else {
             None
         };
+        // Default auth source: the keychain `auth` file in the cwd (TS
+        // parity). Generated on first use; a failure logs and connects
+        // without auth headers rather than killing the service thread.
+        let sign = options.sign.clone().or_else(|| {
+            let keychain = Arc::new(Keychain::new());
+            Some(Arc::new(move || match keychain.sign_default() {
+                Ok(token) => token,
+                Err(error) => {
+                    eprintln!("hub-service-rs: keychain error: {error}");
+                    String::new()
+                }
+            }))
+        });
         Self {
             address,
             profile,
+            sign,
             apps: Vec::new(),
             paths: BTreeSet::new(),
             settings: HashMap::new(),
@@ -566,6 +623,7 @@ impl Service {
         let core = Core {
             address: self.address.clone(),
             profile: self.profile.take(),
+            sign: self.sign.take(),
             apps: std::mem::take(&mut self.apps),
             paths: std::mem::take(&mut self.paths),
             settings: std::mem::take(&mut self.settings),
@@ -672,6 +730,7 @@ impl Drop for ServiceValues {
 struct Core {
     address: Address,
     profile: Option<Profile>,
+    sign: Option<Arc<dyn Fn() -> String + Send + Sync>>,
     apps: Vec<AppHeader>,
     paths: BTreeSet<String>,
     settings: HashMap<String, ApiSettings>,
@@ -796,9 +855,23 @@ impl Core {
                 continue;
             }
             if client.is_none() {
+                // Fresh hub-pro auth token per connect (expiry changes): the
+                // raw header block is attached to the HTTP upgrade request.
+                let headers = self.sign.as_ref().and_then(|sign| {
+                    let token = sign();
+                    if token.is_empty() {
+                        None
+                    } else {
+                        Some(auth_header_block(&token))
+                    }
+                });
+                let options = ConnectOptions {
+                    headers,
+                    state: None,
+                };
                 let result = match &self.address {
-                    Address::Port(port) => channel.connect(*port, ConnectOptions::default()),
-                    Address::Url(url) => channel.connect(url.clone(), ConnectOptions::default()),
+                    Address::Port(port) => channel.connect(*port, options),
+                    Address::Url(url) => channel.connect(url.clone(), options),
                 };
                 match result {
                     Ok(c) => {

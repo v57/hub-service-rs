@@ -7,9 +7,12 @@ Rust port of [hub-service](https://github.com/v57/hub-service) — connect to a
 [hub](https://github.com/v57/hub-lite) (default `ws://127.0.0.1:1997`), host
 your own post/stream API endpoints, register apps, and call API through the hub.
 
-Lite port: no auth, no keychain, no crypto (hub-pro territory). The wire
-contract matches the TS reference (`hub/profile/update`, `hub/service/update`,
-AppInterface + element DSL).
+Hub-pro auth (TS keychain parity): the service loads-or-generates the ed25519
+`auth` key file in the working directory and attaches a freshly signed
+`key.<pub>.<sig>.<expiry>` token as the raw `auth: ...\r\nv: 0\r\n` header
+block on EVERY (re)connect — hub-lite ignores the headers entirely, so the
+port stays regression-safe. The wire contract matches the TS reference
+(`hub/profile/update`, `hub/service/update`, AppInterface + element DSL).
 
 ## Install
 
@@ -64,7 +67,10 @@ let response = service.send("echo/upper", json!("hello"))?; // "HELLO"
 ## API
 
 - `Service::new(ServiceOptions)` — `address` (port or ws:// URL; default
-  `1997` or `$HUB`), `name`, `icon`
+  `1997` or `$HUB`), `name`, `icon`, `sign` (optional token factory; default:
+  `Keychain` reading `auth` in the cwd, or `$HUBKEY`)
+- `Keychain` / `KeychainError` — `sign(expires)` → `key.<pub>.<sig>.<expiry>`,
+  `public_key()`, `auth_header_block(token)` → the raw `auth`+`v` headers
 - `post(path, handler)` / `post_with_settings(path, handler, ApiSettings)` /
   `stream(...)` — fluent; handlers take `serde_json::Value`
 - `app(App)` — register app header + `AppInterface` stream at `header.path`
