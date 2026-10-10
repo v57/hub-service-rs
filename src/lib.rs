@@ -867,7 +867,7 @@ impl Core {
                 });
                 let options = ConnectOptions {
                     headers,
-                    state: None,
+                    ..ConnectOptions::default()
                 };
                 let result = match &self.address {
                     Address::Port(port) => channel.connect(*port, options),
