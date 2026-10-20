@@ -11,8 +11,8 @@
 //!               file)
 //!     sig     = base64 ed25519 signature over the expiry string
 //!     expiry  = DECIMAL epoch-seconds string of now + 10 (TS parity;
-//!               hub-pro reads it as base-36, so the decimal form never
-//!               trips the expiry check)
+//!               hub-pro rejects it once expired or if over 5 minutes
+//!               ahead)
 //! - The hub verifies the signature against the embedded public key and
 //!   treats the key as the connection identity (owner/host/group).
 //!
