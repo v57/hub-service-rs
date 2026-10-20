@@ -1,7 +1,7 @@
 //! Device layer test vectors (`Docs/Devices/vectors.json`): every SDK must
 //! reproduce these strings exactly.
 
-use hub_service_rs::{Certificate, auth_token, device_id, encode_certificate, safety_code};
+use hub_service_rs::{Caller, Certificate, auth_token, device_id, encode_certificate, safety_code};
 use serde_json::Value;
 
 fn vectors() -> Value {
@@ -99,5 +99,26 @@ fn device_id_and_safety_code() {
     assert_eq!(
         safety_code(key).as_deref(),
         Some(text(&v, "/keys/device/safetyCode"))
+    );
+}
+
+#[test]
+fn caller() {
+    let v = vectors();
+    let caller = Caller::from_context(v.pointer("/caller/context").unwrap()).expect("caller");
+    assert_eq!(
+        caller.key.as_deref(),
+        Some(text(&v, "/keys/service/publicKey"))
+    );
+    let device = caller.device.expect("device");
+    assert_eq!(device.id, text(&v, "/keys/device/deviceId"));
+    assert_eq!(device.name, "Mac Studio");
+    assert_eq!(caller.groups, vec!["owners"]);
+    assert!(caller.owner);
+    assert_eq!(caller.via, None);
+    assert_eq!(caller.claimed, None);
+    assert_eq!(
+        caller.hub_key.as_deref(),
+        Some(text(&v, "/keys/hub/publicKey"))
     );
 }

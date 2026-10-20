@@ -1,9 +1,10 @@
 //! Connect flow against an in-process fake hub (a channel-rs server): v0
 //! connect, hub/info, hub key pin, v1 reconnect; hub-lite stays on v0.
 
-use channel_rs::{Channel, ListenOptions, PostRequest, Server};
+use channel_rs::{CallResult, Channel, ListenOptions, PostRequest, Sender, Server};
 use hub_service_rs::{Address, DeviceKey, Keychain, Service, ServiceOptions, auth_token};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -36,6 +37,7 @@ struct FakeHub {
     _channel: Channel<HubState>,
     server: Server<HubState>,
     connects: Connects,
+    sender: Rc<RefCell<Option<Sender<HubState>>>>,
 }
 
 impl FakeHub {
@@ -55,6 +57,8 @@ impl FakeHub {
                 .unwrap();
         }
         let log = connects.clone();
+        let sender: Rc<RefCell<Option<Sender<HubState>>>> = Rc::default();
+        let latest = sender.clone();
         let server = channel
             .listen(
                 0_u16,
@@ -62,6 +66,9 @@ impl FakeHub {
                     state: Some(Rc::new(move |headers: &HashMap<String, String>| {
                         log.lock().unwrap().push(headers.clone());
                         Ok(HubState)
+                    })),
+                    on_connect: Some(Rc::new(move |_state: &mut HubState, sender| {
+                        *latest.borrow_mut() = Some(sender);
                     })),
                     ..ListenOptions::default()
                 },
@@ -71,6 +78,7 @@ impl FakeHub {
             _channel: channel,
             server,
             connects,
+            sender,
         }
     }
 
@@ -207,4 +215,42 @@ fn disabled_device_mode_sends_no_certificate() {
     assert_eq!(connects.len(), 1);
     assert!(!connects[0].contains_key("device"));
     assert!(!dir.join("device.key").exists());
+}
+
+#[test]
+fn handlers_see_the_caller() {
+    let dir = temp_dir("caller");
+    let keychain = Arc::new(Keychain::with_path(dir.join("auth")));
+    let mut hub = FakeHub::start(false);
+    let mut service = service_for(&hub, &keychain);
+    service.post_request("who", |request| {
+        Ok(match request.caller {
+            Some(caller) => json!({
+                "key": caller.key,
+                "device": caller.device.map(|device| device.name),
+                "owner": caller.owner,
+                "body": request.body,
+            }),
+            None => Value::Null,
+        })
+    });
+    service.start();
+    hub.pump(1, Duration::from_secs(5));
+
+    let sender = hub.sender.borrow_mut().take().expect("service connected");
+    let context = json!({"hub": {"caller": {
+        "key": "K", "device": {"id": "d", "name": "Mac Studio"}, "groups": ["owners"], "owner": true
+    }, "hubKey": HUB_KEY}});
+    let reply = sender
+        .send_with_context::<Value, Value, Value>("who", json!(7), context)
+        .unwrap();
+    assert!(
+        matches!(&reply, CallResult::Ok(Some(value)) if *value == json!({"key": "K", "device": "Mac Studio", "owner": true, "body": 7}))
+    );
+
+    let reply = sender.send::<Value, Value>("who", json!(7)).unwrap();
+    assert!(matches!(
+        reply,
+        CallResult::Ok(None) | CallResult::Ok(Some(Value::Null))
+    ));
 }

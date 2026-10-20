@@ -88,6 +88,10 @@ let response = service.send("echo/upper", json!("hello"))?; // "HELLO"
   `safety_code` — the device key file and service certificates
 - `post(path, handler)` / `post_with_settings(path, handler, ApiSettings)` /
   `stream(...)` — fluent; handlers take `serde_json::Value`
+- `post_request(path, handler)` / `stream_request(...)` (and `_with_settings`)
+  — handlers take a `Request { body, caller, context }`; `caller` is the hub's
+  `Caller { key, device, groups, owner, via, claimed, hub_key }`, `None` when
+  the call carries no hub caller (hub-lite)
 - `app(App)` — register app header + `AppInterface` stream at `header.path`
 - `send(path, body)` / `values(path, body)` — client calls through the hub
 - `start()` — connect + poll thread; detects `is_connected` false→true per

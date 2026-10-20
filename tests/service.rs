@@ -4,7 +4,7 @@
 
 use channel_rs::ChannelError;
 use hub_service_rs::{
-    ApiSettings, App, AppHeader, Service, ServiceOptions, ServicePermissions,
+    ApiSettings, App, AppHeader, Caller, Request, Service, ServiceOptions, ServicePermissions,
 };
 use serde_json::{json, Value};
 
@@ -118,4 +118,37 @@ fn app_interface_shape() {
     assert_eq!(object["header"]["name"], "Echo");
     assert_eq!(object["header"]["path"], "echo/ui");
     assert_eq!(object["body"], json!(["hi"]));
+}
+
+#[test]
+fn caller_is_absent_without_hub_context() {
+    assert_eq!(Caller::from_context(&json!({})), None);
+    assert_eq!(Caller::from_context(&json!({"service": "abc"})), None);
+    assert!(Request::new(json!(1), json!({})).caller.is_none());
+}
+
+#[test]
+fn caller_anonymous_and_through_a_merged_hub() {
+    let anonymous = Caller::from_context(&json!({
+        "hub": {"caller": {"groups": [], "owner": false}, "hubKey": "H"}
+    }))
+    .expect("caller");
+    assert_eq!(anonymous.key, None);
+    assert_eq!(anonymous.device, None);
+    assert!(!anonymous.owner);
+    assert_eq!(anonymous.hub_key.as_deref(), Some("H"));
+
+    let merged = Request::new(
+        json!("body"),
+        json!({"service": "s", "hub": {"caller": {
+            "key": "M", "groups": ["g1", "g2"], "owner": false,
+            "via": "V", "claimed": {"key": "K", "owner": true}
+        }, "hubKey": "H"}}),
+    );
+    let caller = merged.caller.expect("caller");
+    assert_eq!(caller.key.as_deref(), Some("M"));
+    assert_eq!(caller.groups, vec!["g1", "g2"]);
+    assert_eq!(caller.via.as_deref(), Some("V"));
+    assert_eq!(caller.claimed, Some(json!({"key": "K", "owner": true})));
+    assert_eq!(merged.context["service"], "s");
 }

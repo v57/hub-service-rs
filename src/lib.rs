@@ -16,7 +16,7 @@
 //! contract matches the TS reference: `hub/profile/update`,
 //! `hub/service/update` on every (re)connect, AppInterface + element DSL.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::env;
@@ -470,6 +470,78 @@ pub fn spacer() -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Caller identity
+// ---------------------------------------------------------------------------
+
+/// The caller's device, when its connection is device-attached.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct CallerDevice {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// Who is calling (`Docs/Devices/protocol.md` section 4), from
+/// `context.hub.caller`. The hub replaces any client-supplied `context.hub`,
+/// so handlers can trust it.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct Caller {
+    /// Caller SPKI; `None` for anonymous callers.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// `None` unless the caller's connection is device-attached.
+    #[serde(default)]
+    pub device: Option<CallerDevice>,
+    /// Groups of the key or its device.
+    #[serde(default)]
+    pub groups: Vec<String>,
+    /// Member of the owners group.
+    #[serde(default)]
+    pub owner: bool,
+    /// Merged hub SPKI when the call came through a merged hub.
+    #[serde(default)]
+    pub via: Option<String>,
+    /// The merged hub's own caller (unverified).
+    #[serde(default)]
+    pub claimed: Option<Value>,
+    /// The forwarding hub's key (`context.hub.hubKey`).
+    #[serde(skip)]
+    pub hub_key: Option<String>,
+}
+
+impl Caller {
+    /// The caller in a request context; `None` when it has no hub caller
+    /// (hub-lite, or a call that didn't come through a hub).
+    pub fn from_context(context: &Value) -> Option<Caller> {
+        let hub = context.get("hub")?;
+        let mut caller: Caller = serde_json::from_value(hub.get("caller")?.clone()).ok()?;
+        caller.hub_key = hub.get("hubKey").and_then(Value::as_str).map(str::to_string);
+        Some(caller)
+    }
+}
+
+/// A request handed to [`Service::post_request`] and
+/// [`Service::stream_request`] handlers.
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub body: Value,
+    /// Who is calling; `None` when the call carries no hub caller.
+    pub caller: Option<Caller>,
+    /// The whole request context (`service`/`device` selection, `hub`).
+    pub context: Value,
+}
+
+impl Request {
+    pub fn new(body: Value, context: Value) -> Self {
+        Self {
+            body,
+            caller: Caller::from_context(&context),
+            context,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -508,13 +580,13 @@ impl From<ChannelError> for ServiceError {
 // Service
 // ---------------------------------------------------------------------------
 
-type PostHandler = Box<dyn Fn(Value) -> Result<Value, ChannelError> + Send + Sync>;
-type StreamHandler = Box<dyn Fn(Value) -> Result<Vec<Value>, ChannelError> + Send + Sync>;
+type PostHandler = Box<dyn Fn(Request) -> Result<Value, ChannelError> + Send + Sync>;
+type StreamHandler = Box<dyn Fn(Request) -> Result<Vec<Value>, ChannelError> + Send + Sync>;
 
 /// Requests routed from [`Service::send`]/[`Service::values`] to the poll
 /// thread. Everything touching the channel-rs client happens on that one
 /// thread (channel-rs is single-threaded per client).
-enum Request {
+enum Command {
     Send {
         path: String,
         body: Value,
@@ -553,7 +625,7 @@ pub struct Service {
     posts: Vec<(String, PostHandler)>,
     streams: Vec<(String, StreamHandler)>,
     app_interfaces: Vec<(String, Value)>,
-    requests: OnceLock<mpsc::Sender<Request>>,
+    requests: OnceLock<mpsc::Sender<Command>>,
 }
 
 impl Service {
@@ -616,6 +688,28 @@ impl Service {
     where
         F: Fn(Value) -> Result<Value, ChannelError> + Send + Sync + 'static,
     {
+        self.post_request_with_settings(path, move |request| handler(request.body), settings)
+    }
+
+    /// Registers a request/response API endpoint whose handler also gets the
+    /// caller and the request context.
+    pub fn post_request<F>(&mut self, path: impl Into<String>, handler: F) -> &mut Self
+    where
+        F: Fn(Request) -> Result<Value, ChannelError> + Send + Sync + 'static,
+    {
+        self.post_request_with_settings(path, handler, ApiSettings::default())
+    }
+
+    /// [`Service::post_request`] with wire-parity settings.
+    pub fn post_request_with_settings<F>(
+        &mut self,
+        path: impl Into<String>,
+        handler: F,
+        settings: ApiSettings,
+    ) -> &mut Self
+    where
+        F: Fn(Request) -> Result<Value, ChannelError> + Send + Sync + 'static,
+    {
         let path = path.into();
         self.add_path(&path, settings);
         self.posts.push((path, Box::new(handler)));
@@ -640,6 +734,28 @@ impl Service {
     ) -> &mut Self
     where
         F: Fn(Value) -> Result<Vec<Value>, ChannelError> + Send + Sync + 'static,
+    {
+        self.stream_request_with_settings(path, move |request| handler(request.body), settings)
+    }
+
+    /// Registers a streaming API endpoint whose handler also gets the caller
+    /// and the request context.
+    pub fn stream_request<F>(&mut self, path: impl Into<String>, handler: F) -> &mut Self
+    where
+        F: Fn(Request) -> Result<Vec<Value>, ChannelError> + Send + Sync + 'static,
+    {
+        self.stream_request_with_settings(path, handler, ApiSettings::default())
+    }
+
+    /// [`Service::stream_request`] with wire-parity settings.
+    pub fn stream_request_with_settings<F>(
+        &mut self,
+        path: impl Into<String>,
+        handler: F,
+        settings: ApiSettings,
+    ) -> &mut Self
+    where
+        F: Fn(Request) -> Result<Vec<Value>, ChannelError> + Send + Sync + 'static,
     {
         let path = path.into();
         self.add_path(&path, settings);
@@ -748,7 +864,7 @@ impl Service {
     pub fn send(&self, path: &str, body: Value) -> Result<Value, ServiceError> {
         let tx = self.requests.get().ok_or(ServiceError::NotStarted)?;
         let (rtx, rrx) = mpsc::channel();
-        tx.send(Request::Send {
+        tx.send(Command::Send {
             path: path.to_string(),
             body,
             resp: rtx,
@@ -765,7 +881,7 @@ impl Service {
     pub fn values(&self, path: &str, body: Value) -> Result<ServiceValues, ServiceError> {
         let tx = self.requests.get().ok_or(ServiceError::NotStarted)?;
         let (rtx, rrx) = mpsc::channel();
-        tx.send(Request::Values {
+        tx.send(Command::Values {
             path: path.to_string(),
             body,
             resp: rtx,
@@ -799,7 +915,7 @@ impl Service {
 /// [`next`]: ServiceValues::next
 pub struct ServiceValues {
     id: u64,
-    tx: mpsc::Sender<Request>,
+    tx: mpsc::Sender<Command>,
     done: bool,
 }
 
@@ -811,7 +927,7 @@ impl ServiceValues {
         }
         let (rtx, rrx) = mpsc::channel();
         self.tx
-            .send(Request::ValuesNext {
+            .send(Command::ValuesNext {
                 id: self.id,
                 resp: rtx,
             })
@@ -829,7 +945,7 @@ impl ServiceValues {
 
 impl Drop for ServiceValues {
     fn drop(&mut self) {
-        let _ = self.tx.send(Request::ValuesClose { id: self.id });
+        let _ = self.tx.send(Command::ValuesClose { id: self.id });
     }
 }
 
@@ -852,7 +968,7 @@ struct Core {
     posts: Vec<(String, PostHandler)>,
     streams: Vec<(String, StreamHandler)>,
     app_interfaces: Vec<(String, Value)>,
-    rx: mpsc::Receiver<Request>,
+    rx: mpsc::Receiver<Command>,
 }
 
 impl Core {
@@ -879,14 +995,16 @@ impl Core {
 
         for (path, handler) in self.posts.drain(..) {
             channel
-                .post::<Value, Value, (), _>(path, move |request| handler(request.body).map(Some))
+                .post::<Value, Value, Value, _>(path, move |request| {
+                    handler(Request::new(request.body, request.context)).map(Some)
+                })
                 .expect("register post handler");
         }
         for (path, handler) in self.streams.drain(..) {
             channel
-                .stream::<Value, Value, (), _>(path, move |request| {
+                .stream::<Value, Value, Value, _>(path, move |request| {
                     let mut emitter = request.emitter;
-                    for item in handler(request.body)? {
+                    for item in handler(Request::new(request.body, request.context))? {
                         emitter.emit(item)?;
                     }
                     Ok(())
@@ -909,16 +1027,16 @@ impl Core {
 
         loop {
             // Serve client calls (send / values) on this thread.
-            while let Ok(request) = self.rx.try_recv() {
-                match request {
-                    Request::Send { path, body, resp } => {
+            while let Ok(command) = self.rx.try_recv() {
+                match command {
+                    Command::Send { path, body, resp } => {
                         let result = match client.as_mut() {
                             Some(client) => client.sender().send::<Value, Value>(&path, body),
                             None => Err(ChannelError::new("not connected")),
                         };
                         let _ = resp.send(result);
                     }
-                    Request::Values { path, body, resp } => {
+                    Command::Values { path, body, resp } => {
                         let result = match client.as_mut() {
                             Some(client) => {
                                 client.sender().values::<Value, Value, ()>(&path, body, ())
@@ -932,14 +1050,14 @@ impl Core {
                             id
                         }));
                     }
-                    Request::ValuesNext { id, resp } => {
+                    Command::ValuesNext { id, resp } => {
                         let result = match values.iter_mut().find(|(i, _)| *i == id) {
                             Some((_, stream)) => stream.next(),
                             None => Ok(StreamNext::Done),
                         };
                         let _ = resp.send(result);
                     }
-                    Request::ValuesClose { id } => {
+                    Command::ValuesClose { id } => {
                         if let Some(index) = values.iter().position(|(i, _)| *i == id) {
                             let (_, mut stream) = values.remove(index);
                             stream.close();
