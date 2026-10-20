@@ -3,13 +3,15 @@
 //! Connect to a hub (hub-lite / hub-pro), host post/stream API endpoints,
 //! register apps, and call API through the hub.
 //!
-//! Hub-pro auth (TS keychain parity): the service loads-or-generates the
-//! ed25519 `auth` key file in the cwd and attaches a freshly signed
-//! `key.<pub>.<sig>.<expiry>` token as the raw `auth: ...\r\nv: 0\r\n`
-//! header block on EVERY (re)connect (hub-lite ignores the headers entirely,
-//! so the port stays regression-safe). The wire contract matches the TS
-//! reference: `hub/profile/update`, `hub/service/update` on every
-//! (re)connect, AppInterface + element DSL.
+//! Hub-pro auth (TS keychain parity, `Docs/Devices/protocol.md`): the
+//! service loads-or-generates the ed25519 `auth` key file in the cwd and
+//! attaches a freshly signed `key.<pub>.<sig>.<expiry>` token as the raw
+//! `auth`/`v` header block on EVERY (re)connect (hub-lite ignores the headers
+//! entirely, so the port stays regression-safe). With no hub key pinned for
+//! the address it connects with v0, asks `hub/info` for the hub key, pins it
+//! in `hubs.json` and reconnects with a v1 token bound to that hub. The wire
+//! contract matches the TS reference: `hub/profile/update`,
+//! `hub/service/update` on every (re)connect, AppInterface + element DSL.
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -25,16 +27,26 @@ use std::time::Duration;
 pub use channel_rs::*;
 
 mod keychain;
-pub use keychain::{Keychain, KeychainError};
+pub use keychain::{AUTH_EXPIRY, Keychain, KeychainError, auth_token};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const POLL_SLEEP: Duration = Duration::from_millis(1);
 
-/// The raw header block attached to the WebSocket upgrade request on every
-/// (re)connect: `auth: <fresh token>` + `v: 0` (channel-rs appends the final
-/// CRLF itself; keeping ours makes the block self-contained).
+/// The v0 raw header block for the WebSocket upgrade request:
+/// `auth: <fresh token>` + `v: 0` (channel-rs appends the final CRLF itself;
+/// keeping ours makes the block self-contained).
 pub fn auth_header_block(token: &str) -> String {
-    format!("auth: {token}\r\nv: 0\r\n")
+    connect_header_block(token, 0, None)
+}
+
+/// The raw handshake header block: `auth`, `v` (0 or 1) and, when given,
+/// the `device` certificate.
+pub fn connect_header_block(token: &str, version: u8, device: Option<&str>) -> String {
+    let mut block = format!("auth: {token}\r\nv: {version}\r\n");
+    if let Some(device) = device {
+        block.push_str(&format!("device: {device}\r\n"));
+    }
+    block
 }
 
 // ---------------------------------------------------------------------------
@@ -57,11 +69,14 @@ pub struct ServiceOptions {
     pub name: Option<String>,
     /// Profile icon: a string or `{"symbol": ..., "text": ...}`.
     pub icon: Option<Value>,
-    /// Optional token factory for hub-pro auth (default: the keychain `auth`
-    /// file in the cwd, TS parity). The returned token is attached as the
-    /// raw `auth` header on every (re)connect; an empty string connects
-    /// without auth headers (e.g. the default keychain failed to load).
+    /// Optional v0 token factory for hub-pro auth, replacing the keychain.
+    /// The returned token is attached as the raw `auth` header on every
+    /// (re)connect; an empty string connects without auth headers. No hub
+    /// key is learned or pinned with a custom factory.
     pub sign: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    /// The keychain to sign with and keep hub key pins in (default:
+    /// [`Keychain::new`], the `auth` file in the cwd or `$HUBKEY`).
+    pub keychain: Option<Arc<Keychain>>,
 }
 
 impl fmt::Debug for ServiceOptions {
@@ -71,6 +86,7 @@ impl fmt::Debug for ServiceOptions {
             .field("name", &self.name)
             .field("icon", &self.icon)
             .field("sign", &self.sign.as_ref().map(|_| "<closure>"))
+            .field("keychain", &self.keychain.as_ref().map(|keychain| keychain.path().to_path_buf()))
             .finish()
     }
 }
@@ -82,6 +98,18 @@ impl Clone for ServiceOptions {
             name: self.name.clone(),
             icon: self.icon.clone(),
             sign: self.sign.clone(),
+            keychain: self.keychain.clone(),
+        }
+    }
+}
+
+impl Address {
+    /// The address as a URL: a port becomes `ws://127.0.0.1:<port>`. Hub key
+    /// pins are stored under it.
+    pub fn url(&self) -> String {
+        match self {
+            Address::Port(port) => format!("ws://127.0.0.1:{port}"),
+            Address::Url(url) => url.clone(),
         }
     }
 }
@@ -482,6 +510,7 @@ pub struct Service {
     address: Address,
     profile: Option<Profile>,
     sign: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    keychain: Option<Arc<Keychain>>,
     apps: Vec<AppHeader>,
     paths: BTreeSet<String>,
     settings: HashMap<String, ApiSettings>,
@@ -504,22 +533,16 @@ impl Service {
             None
         };
         // Default auth source: the keychain `auth` file in the cwd (TS
-        // parity). Generated on first use; a failure logs and connects
-        // without auth headers rather than killing the service thread.
-        let sign = options.sign.clone().or_else(|| {
-            let keychain = Arc::new(Keychain::new());
-            Some(Arc::new(move || match keychain.sign_default() {
-                Ok(token) => token,
-                Err(error) => {
-                    eprintln!("hub-service-rs: keychain error: {error}");
-                    String::new()
-                }
-            }))
-        });
+        // parity), generated on first use. A custom `sign` factory replaces it.
+        let keychain = match options.sign {
+            Some(_) => None,
+            None => Some(options.keychain.clone().unwrap_or_else(|| Arc::new(Keychain::new()))),
+        };
         Self {
             address,
             profile,
-            sign,
+            sign: options.sign.clone(),
+            keychain,
             apps: Vec::new(),
             paths: BTreeSet::new(),
             settings: HashMap::new(),
@@ -607,6 +630,16 @@ impl Service {
         }
     }
 
+    /// Forgets the hub key pinned for this service's address. Use it when a
+    /// v1 connect keeps failing with `invalid signature` because the hub's
+    /// key changed on purpose; the next connect learns it again.
+    pub fn forget_hub_key(&self) -> Result<(), KeychainError> {
+        match &self.keychain {
+            Some(keychain) => keychain.forget_hub_key(&self.address.url()),
+            None => Ok(()),
+        }
+    }
+
     /// The profile sent as `hub/profile/update`, if name/icon were set.
     pub fn profile(&self) -> Option<&Profile> {
         self.profile.as_ref()
@@ -624,6 +657,8 @@ impl Service {
             address: self.address.clone(),
             profile: self.profile.take(),
             sign: self.sign.take(),
+            keychain: self.keychain.clone(),
+            hub_key_known: false,
             apps: std::mem::take(&mut self.apps),
             paths: std::mem::take(&mut self.paths),
             settings: std::mem::take(&mut self.settings),
@@ -731,6 +766,9 @@ struct Core {
     address: Address,
     profile: Option<Profile>,
     sign: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    keychain: Option<Arc<Keychain>>,
+    /// The current connection used a pinned hub key (v1).
+    hub_key_known: bool,
     apps: Vec<AppHeader>,
     paths: BTreeSet<String>,
     settings: HashMap<String, ApiSettings>,
@@ -842,6 +880,13 @@ impl Core {
                     if !connected {
                         self.send_updates(c);
                         connected = true;
+                        if !self.hub_key_known && self.learn_hub_key(c) {
+                            // Reconnect at once with the hub-bound v1 token.
+                            client = None;
+                            values.clear();
+                            connected = false;
+                            continue;
+                        }
                     }
                 } else {
                     dropped = true;
@@ -857,14 +902,7 @@ impl Core {
             if client.is_none() {
                 // Fresh hub-pro auth token per connect (expiry changes): the
                 // raw header block is attached to the HTTP upgrade request.
-                let headers = self.sign.as_ref().and_then(|sign| {
-                    let token = sign();
-                    if token.is_empty() {
-                        None
-                    } else {
-                        Some(auth_header_block(&token))
-                    }
-                });
+                let headers = self.connect_headers();
                 let options = ConnectOptions {
                     headers,
                     ..ConnectOptions::default()
@@ -882,6 +920,42 @@ impl Core {
                 }
             }
             thread::sleep(POLL_SLEEP);
+        }
+    }
+
+    /// The handshake header block for the next connect: a v1 token when a
+    /// hub key is pinned for the address, else v0.
+    fn connect_headers(&mut self) -> Option<String> {
+        if let Some(sign) = &self.sign {
+            let token = sign();
+            return (!token.is_empty()).then(|| auth_header_block(&token));
+        }
+        let keychain = self.keychain.as_ref()?;
+        let hub_key = keychain.hub_key(&self.address.url());
+        self.hub_key_known = hub_key.is_some();
+        // A keychain failure logs and connects without auth headers rather
+        // than killing the service thread.
+        match keychain.sign_for_hub(hub_key.as_deref(), AUTH_EXPIRY) {
+            Ok(token) => Some(connect_header_block(&token, if hub_key.is_some() { 1 } else { 0 }, None)),
+            Err(error) => {
+                eprintln!("hub-service-rs: keychain error: {error}");
+                None
+            }
+        }
+    }
+
+    /// Asks `hub/info` for the hub key and pins it. True when a key was
+    /// pinned (the caller reconnects with v1); hub-lite answers with an error.
+    fn learn_hub_key(&self, client: &mut Client<()>) -> bool {
+        let Some(keychain) = &self.keychain else {
+            return false;
+        };
+        let Ok(CallResult::Ok(Some(info))) = client.sender().send::<Value, ()>("hub/info", ()) else {
+            return false;
+        };
+        match info.get("key").and_then(Value::as_str) {
+            Some(key) if !key.is_empty() => keychain.pin_hub_key(&self.address.url(), key).is_ok(),
+            _ => false,
         }
     }
 
