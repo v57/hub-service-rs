@@ -13,7 +13,11 @@ directory and attaches a freshly signed `key.<pub>.<sig>.<expiry>` token as the
 raw `auth`/`v` header block on EVERY (re)connect — hub-lite ignores the headers
 entirely, so the port stays regression-safe. On the first connection to a hub
 it asks `hub/info` for the hub key, pins it in `hubs.json` beside the key file
-and reconnects with a v1 token that only that hub accepts. The wire contract matches the TS reference
+and reconnects with a v1 token that only that hub accepts. Unless
+`disable_device` is set, every connect also sends a `device` header: a
+certificate for the service key signed by the device key (`~/.hub/device.key`,
+`/var/lib/hub/device.key` for root, or `$HUB_DEVICE_KEY`; created on first
+use), renewed when less than a day of its 7 days is left. The wire contract matches the TS reference
 (`hub/profile/update`, `hub/service/update`, AppInterface + element DSL).
 
 ## Install
@@ -76,7 +80,12 @@ let response = service.send("echo/upper", json!("hello"))?; // "HELLO"
   `sign_for_hub(hub_key, expires)` (v1) → `key.<pub>.<sig>.<expiry>`,
   `public_key()`, `hub_key` / `pin_hub_key` / `forget_hub_key(address)`;
   `auth_token(key_file, hub_key, expiry)`, `connect_header_block(token, v, device)`
+  Device options: `instance` (default: `name`, else the first path segment),
+  `device_name` (default: the host name), `parent`, `device_key`,
+  `disable_device`
 - `forget_hub_key()` — drop this service's pin after the hub's key changed
+- `DeviceKey`, `Certifier`, `Certificate`, `encode_certificate`, `device_id`,
+  `safety_code` — the device key file and service certificates
 - `post(path, handler)` / `post_with_settings(path, handler, ApiSettings)` /
   `stream(...)` — fluent; handlers take `serde_json::Value`
 - `app(App)` — register app header + `AppInterface` stream at `header.path`

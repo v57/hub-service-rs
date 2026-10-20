@@ -475,9 +475,11 @@ dependencies = [
  "base64",
  "channel-rs",
  "ed25519-dalek",
+ "libc",
  "rand",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

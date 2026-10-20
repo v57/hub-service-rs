@@ -2,7 +2,7 @@
 //! connect, hub/info, hub key pin, v1 reconnect; hub-lite stays on v0.
 
 use channel_rs::{Channel, ListenOptions, PostRequest, Server};
-use hub_service_rs::{Address, Keychain, Service, ServiceOptions, auth_token};
+use hub_service_rs::{Address, DeviceKey, Keychain, Service, ServiceOptions, auth_token};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
@@ -95,9 +95,12 @@ impl FakeHub {
 }
 
 fn service_for(hub: &FakeHub, keychain: &Arc<Keychain>) -> Service {
+    // The device key sits beside the temp key file, never in ~/.hub.
+    let device_key = keychain.path().with_file_name("device.key");
     Service::new(ServiceOptions {
         address: Some(Address::Port(hub.server.port())),
         keychain: Some(keychain.clone()),
+        device_key: Some(Arc::new(DeviceKey::with_path(device_key))),
         ..ServiceOptions::default()
     })
 }
@@ -158,4 +161,50 @@ fn hub_lite_stays_on_v0() {
     assert_eq!(connects.len(), 1);
     assert_eq!(connects[0]["v"], "0");
     assert!(!dir.join("hubs.json").exists());
+}
+
+#[test]
+fn every_connect_carries_the_device_certificate() {
+    let dir = temp_dir("device");
+    let keychain = Arc::new(Keychain::with_path(dir.join("auth")));
+    let mut hub = FakeHub::start(true);
+    let mut service = service_for(&hub, &keychain);
+    service.start();
+    hub.pump(2, Duration::from_secs(5));
+
+    let connects = hub.connects();
+    assert_eq!(connects.len(), 2);
+    // Same certificate on the reconnect (renewed only with a day left).
+    assert_eq!(connects[0]["device"], connects[1]["device"]);
+    let device_key = DeviceKey::with_path(dir.join("device.key"));
+    let (payload, _) = connects[1]["device"].split_once('.').unwrap();
+    use base64::Engine;
+    let json: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json["device"], device_key.public_key().unwrap());
+    assert_eq!(json["service"], keychain.public_key().unwrap());
+}
+
+#[test]
+fn disabled_device_mode_sends_no_certificate() {
+    let dir = temp_dir("nodevice");
+    let keychain = Arc::new(Keychain::with_path(dir.join("auth")));
+    let mut hub = FakeHub::start(false);
+    let mut service = Service::new(ServiceOptions {
+        address: Some(Address::Port(hub.server.port())),
+        keychain: Some(keychain.clone()),
+        disable_device: true,
+        ..ServiceOptions::default()
+    });
+    service.start();
+    hub.pump(1, Duration::from_secs(5));
+
+    let connects = hub.connects();
+    assert_eq!(connects.len(), 1);
+    assert!(!connects[0].contains_key("device"));
+    assert!(!dir.join("device.key").exists());
 }

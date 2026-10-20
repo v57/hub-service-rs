@@ -9,7 +9,10 @@
 //! `auth`/`v` header block on EVERY (re)connect (hub-lite ignores the headers
 //! entirely, so the port stays regression-safe). With no hub key pinned for
 //! the address it connects with v0, asks `hub/info` for the hub key, pins it
-//! in `hubs.json` and reconnects with a v1 token bound to that hub. The wire
+//! in `hubs.json` and reconnects with a v1 token bound to that hub. Unless
+//! disabled, every connect also sends a certificate for the service key
+//! signed by the device key (see [`DeviceKey`]), renewed when less than a day
+//! is left. The wire
 //! contract matches the TS reference: `hub/profile/update`,
 //! `hub/service/update` on every (re)connect, AppInterface + element DSL.
 
@@ -26,7 +29,12 @@ use std::time::Duration;
 
 pub use channel_rs::*;
 
+mod device;
 mod keychain;
+pub use device::{
+    CERTIFICATE_LIFETIME, CERTIFICATE_RENEW, Certificate, Certifier, DeviceKey, device_id,
+    encode_certificate, host_name, platform, safety_code,
+};
 pub use keychain::{AUTH_EXPIRY, Keychain, KeychainError, auth_token};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -77,6 +85,19 @@ pub struct ServiceOptions {
     /// The keychain to sign with and keep hub key pins in (default:
     /// [`Keychain::new`], the `auth` file in the cwd or `$HUBKEY`).
     pub keychain: Option<Arc<Keychain>>,
+    /// Instance name in the device certificate, unique per device
+    /// (`s3-local/Backup Disk`). Default: `name`, else the first segment of
+    /// the first registered path, else `service`.
+    pub instance: Option<String>,
+    /// Suggested device name in the certificate. Default: the host name.
+    pub device_name: Option<String>,
+    /// Declared parent device name, for containers and VMs.
+    pub parent: Option<String>,
+    /// The device key (default: [`DeviceKey::new`], `~/.hub/device.key` or
+    /// `$HUB_DEVICE_KEY`).
+    pub device_key: Option<Arc<DeviceKey>>,
+    /// No device key and no `device` header: a plain key connection.
+    pub disable_device: bool,
 }
 
 impl fmt::Debug for ServiceOptions {
@@ -87,6 +108,11 @@ impl fmt::Debug for ServiceOptions {
             .field("icon", &self.icon)
             .field("sign", &self.sign.as_ref().map(|_| "<closure>"))
             .field("keychain", &self.keychain.as_ref().map(|keychain| keychain.path().to_path_buf()))
+            .field("instance", &self.instance)
+            .field("device_name", &self.device_name)
+            .field("parent", &self.parent)
+            .field("device_key", &self.device_key.as_ref().map(|key| key.path().to_path_buf()))
+            .field("disable_device", &self.disable_device)
             .finish()
     }
 }
@@ -99,6 +125,11 @@ impl Clone for ServiceOptions {
             icon: self.icon.clone(),
             sign: self.sign.clone(),
             keychain: self.keychain.clone(),
+            instance: self.instance.clone(),
+            device_name: self.device_name.clone(),
+            parent: self.parent.clone(),
+            device_key: self.device_key.clone(),
+            disable_device: self.disable_device,
         }
     }
 }
@@ -511,6 +542,11 @@ pub struct Service {
     profile: Option<Profile>,
     sign: Option<Arc<dyn Fn() -> String + Send + Sync>>,
     keychain: Option<Arc<Keychain>>,
+    instance: Option<String>,
+    device_name: Option<String>,
+    parent: Option<String>,
+    device_key: Option<Arc<DeviceKey>>,
+    first_path: Option<String>,
     apps: Vec<AppHeader>,
     paths: BTreeSet<String>,
     settings: HashMap<String, ApiSettings>,
@@ -538,11 +574,20 @@ impl Service {
             Some(_) => None,
             None => Some(options.keychain.clone().unwrap_or_else(|| Arc::new(Keychain::new()))),
         };
+        let device_key = match options.disable_device {
+            true => None,
+            false => options.device_key.clone().or_else(|| DeviceKey::new().map(Arc::new)),
+        };
         Self {
             address,
-            profile,
             sign: options.sign.clone(),
             keychain,
+            instance: options.instance.clone(),
+            device_name: options.device_name.clone(),
+            parent: options.parent.clone(),
+            device_key,
+            first_path: None,
+            profile,
             apps: Vec::new(),
             paths: BTreeSet::new(),
             settings: HashMap::new(),
@@ -630,6 +675,24 @@ impl Service {
         }
     }
 
+    /// The instance name in the device certificate: the `instance` option,
+    /// else the profile name, else the first segment of the first registered
+    /// path, else `service`.
+    pub fn instance(&self) -> String {
+        if let Some(instance) = self.instance.as_ref().filter(|instance| !instance.is_empty()) {
+            return instance.clone();
+        }
+        if let Some(name) = self.profile.as_ref().and_then(|profile| profile.name.clone()) {
+            if !name.is_empty() {
+                return name;
+            }
+        }
+        match self.first_path.as_deref().and_then(|path| path.split('/').next()) {
+            Some(segment) if !segment.is_empty() => segment.to_string(),
+            _ => "service".to_string(),
+        }
+    }
+
     /// Forgets the hub key pinned for this service's address. Use it when a
     /// v1 connect keeps failing with `invalid signature` because the hub's
     /// key changed on purpose; the next connect learns it again.
@@ -653,7 +716,16 @@ impl Service {
             return self;
         }
         let (tx, rx) = mpsc::channel();
+        let certifier = self.device_key.as_ref().map(|device_key| {
+            Certifier::new(
+                device_key.clone(),
+                &self.instance(),
+                self.device_name.as_deref(),
+                self.parent.as_deref(),
+            )
+        });
         let core = Core {
+            certifier,
             address: self.address.clone(),
             profile: self.profile.take(),
             sign: self.sign.take(),
@@ -708,6 +780,9 @@ impl Service {
     }
 
     fn add_path(&mut self, path: &str, mut settings: ApiSettings) {
+        if self.first_path.is_none() {
+            self.first_path = Some(path.to_string());
+        }
         self.paths.insert(path.to_string());
         if let Some(permissions) = settings.permissions.as_mut() {
             if permissions.group.is_empty() {
@@ -769,6 +844,8 @@ struct Core {
     keychain: Option<Arc<Keychain>>,
     /// The current connection used a pinned hub key (v1).
     hub_key_known: bool,
+    /// Issues the `device` header; `None` when device mode is off.
+    certifier: Option<Certifier>,
     apps: Vec<AppHeader>,
     paths: BTreeSet<String>,
     settings: HashMap<String, ApiSettings>,
@@ -935,13 +1012,30 @@ impl Core {
         self.hub_key_known = hub_key.is_some();
         // A keychain failure logs and connects without auth headers rather
         // than killing the service thread.
-        match keychain.sign_for_hub(hub_key.as_deref(), AUTH_EXPIRY) {
-            Ok(token) => Some(connect_header_block(&token, if hub_key.is_some() { 1 } else { 0 }, None)),
+        let token = match keychain.sign_for_hub(hub_key.as_deref(), AUTH_EXPIRY) {
+            Ok(token) => token,
             Err(error) => {
                 eprintln!("hub-service-rs: keychain error: {error}");
-                None
+                return None;
             }
-        }
+        };
+        // A device key that can't be read or created leaves a plain key
+        // connection.
+        let device = match (&mut self.certifier, keychain.public_key(), keychain::now_seconds()) {
+            (Some(certifier), Ok(service_key), Ok(now)) => match certifier.header(&service_key, now) {
+                Ok(header) => Some(header),
+                Err(error) => {
+                    eprintln!("hub-service-rs: device certificate error: {error}");
+                    None
+                }
+            },
+            _ => None,
+        };
+        Some(connect_header_block(
+            &token,
+            if hub_key.is_some() { 1 } else { 0 },
+            device.as_deref(),
+        ))
     }
 
     /// Asks `hub/info` for the hub key and pins it. True when a key was
