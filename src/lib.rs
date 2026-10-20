@@ -31,11 +31,19 @@ pub use channel_rs::*;
 
 mod device;
 mod keychain;
+mod network;
 pub use device::{
     CERTIFICATE_LIFETIME, CERTIFICATE_RENEW, Certificate, Certifier, DeviceKey, default_device_name,
     device_id, device_mode_enabled, encode_certificate, host_name, platform, safety_code,
 };
 pub use keychain::{AUTH_EXPIRY, Keychain, KeychainError, auth_token};
+pub use network::{
+    LocalTarget, NetworkPolicy, NetworkShare, Protocol, SharePublication, default_agent_socket,
+    parse_iso_ms,
+};
+use network::NetworkPublisher;
+use std::path::PathBuf;
+use std::sync::Mutex;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const POLL_SLEEP: Duration = Duration::from_millis(1);
@@ -102,6 +110,9 @@ pub struct ServiceOptions {
     /// No device key and no `device` header: a plain key connection.
     /// `$HUB_DEVICE=0` (or `off`, `false`, `no`) does the same.
     pub disable_device: bool,
+    /// The hub-net agent socket for share publishing (default:
+    /// [`default_agent_socket`]).
+    pub agent_socket: Option<PathBuf>,
 }
 
 impl fmt::Debug for ServiceOptions {
@@ -117,6 +128,7 @@ impl fmt::Debug for ServiceOptions {
             .field("parent", &self.parent)
             .field("device_key", &self.device_key.as_ref().map(|key| key.path().to_path_buf()))
             .field("disable_device", &self.disable_device)
+            .field("agent_socket", &self.agent_socket)
             .finish()
     }
 }
@@ -134,6 +146,7 @@ impl Clone for ServiceOptions {
             parent: self.parent.clone(),
             device_key: self.device_key.clone(),
             disable_device: self.disable_device,
+            agent_socket: self.agent_socket.clone(),
         }
     }
 }
@@ -581,6 +594,8 @@ pub enum ServiceError {
     Remote(String),
     /// A channel-rs level failure.
     Channel(String),
+    /// Share publishing failed (local agent, attestation or the hub's reply).
+    Network(String),
 }
 
 impl fmt::Display for ServiceError {
@@ -590,6 +605,7 @@ impl fmt::Display for ServiceError {
             ServiceError::Disconnected => write!(f, "Service disconnected"),
             ServiceError::Remote(error) => write!(f, "remote error: {error}"),
             ServiceError::Channel(error) => write!(f, "channel error: {error}"),
+            ServiceError::Network(error) => write!(f, "network error: {error}"),
         }
     }
 }
@@ -630,6 +646,14 @@ enum Command {
     ValuesClose {
         id: u64,
     },
+    PublishShare {
+        share: NetworkShare,
+        resp: mpsc::Sender<Result<Vec<SharePublication>, ServiceError>>,
+    },
+    RemoveShare {
+        name: String,
+        resp: mpsc::Sender<Result<Vec<SharePublication>, ServiceError>>,
+    },
 }
 
 /// Registers API endpoints on a hub and serves calls forwarded by it.
@@ -650,6 +674,7 @@ pub struct Service {
     posts: Vec<(String, PostHandler)>,
     streams: Vec<(String, StreamHandler)>,
     app_interfaces: Vec<(String, Value)>,
+    network: Arc<Mutex<NetworkPublisher>>,
     requests: OnceLock<mpsc::Sender<Command>>,
 }
 
@@ -690,6 +715,7 @@ impl Service {
             posts: Vec::new(),
             streams: Vec::new(),
             app_interfaces: Vec::new(),
+            network: Arc::new(Mutex::new(NetworkPublisher::new(options.agent_socket.clone()))),
             requests: OnceLock::new(),
         }
     }
@@ -830,6 +856,49 @@ impl Service {
             .unwrap_or_else(|| "service".to_string())
     }
 
+    /// Declares a Hub Network share before [`Service::start`]: the complete
+    /// declared set is published on connect and after every reconnect.
+    pub fn share(&mut self, share: NetworkShare) -> Result<&mut Self, ServiceError> {
+        self.network
+            .lock()
+            .map_err(|_| ServiceError::Network("share lock poisoned".into()))?
+            .declare(share)
+            .map_err(ServiceError::Network)?;
+        Ok(self)
+    }
+
+    /// Publishes (or updates) a share now: the local hub-net agent attests
+    /// it and the hub publishes the whole declared set. On failure the set
+    /// is left as it was.
+    pub fn publish_share(&self, share: NetworkShare) -> Result<Vec<SharePublication>, ServiceError> {
+        let tx = self.requests.get().ok_or(ServiceError::NotStarted)?;
+        let (resp, rx) = mpsc::channel();
+        tx.send(Command::PublishShare { share, resp })
+            .map_err(|_| ServiceError::Disconnected)?;
+        rx.recv().map_err(|_| ServiceError::Disconnected)?
+    }
+
+    /// Removes a share and publishes the remaining set.
+    pub fn remove_share(&self, name: &str) -> Result<Vec<SharePublication>, ServiceError> {
+        let tx = self.requests.get().ok_or(ServiceError::NotStarted)?;
+        let (resp, rx) = mpsc::channel();
+        tx.send(Command::RemoveShare {
+            name: name.to_string(),
+            resp,
+        })
+        .map_err(|_| ServiceError::Disconnected)?;
+        rx.recv().map_err(|_| ServiceError::Disconnected)?
+    }
+
+    /// The current share publications (overlay address and port per share),
+    /// in share-name order.
+    pub fn share_publications(&self) -> Vec<SharePublication> {
+        self.network
+            .lock()
+            .map(|network| network.publications())
+            .unwrap_or_default()
+    }
+
     /// Forgets the hub key pinned for this service's address. Use it when a
     /// v1 connect keeps failing with `invalid signature` because the hub's
     /// key changed on purpose; the next connect learns it again.
@@ -863,6 +932,7 @@ impl Service {
         });
         let core = Core {
             certifier,
+            network: self.network.clone(),
             address: self.address.clone(),
             profile: self.profile.take(),
             sign: self.sign.take(),
@@ -980,6 +1050,7 @@ struct Core {
     hub_key_known: bool,
     /// Issues the `device` header; `None` when device mode is off.
     certifier: Option<Certifier>,
+    network: Arc<Mutex<NetworkPublisher>>,
     apps: Vec<AppHeader>,
     paths: BTreeSet<String>,
     settings: HashMap<String, ApiSettings>,
@@ -1081,6 +1152,18 @@ impl Core {
                             stream.close();
                         }
                     }
+                    Command::PublishShare { share, resp } => {
+                        let result = self.with_shares(client.as_mut().filter(|_| connected), |network, keychain, send| {
+                            network.publish(share, keychain, send)
+                        });
+                        let _ = resp.send(result);
+                    }
+                    Command::RemoveShare { name, resp } => {
+                        let result = self.with_shares(client.as_mut().filter(|_| connected), |network, keychain, send| {
+                            network.remove(&name, keychain, send)
+                        });
+                        let _ = resp.send(result);
+                    }
                 }
             }
 
@@ -1099,6 +1182,14 @@ impl Core {
                             values.clear();
                             connected = false;
                             continue;
+                        }
+                        let republish = self.network.lock().map(|network| network.has_shares()).unwrap_or(false);
+                        if republish {
+                            if let Err(error) = self.with_shares(Some(c), |network, keychain, send| {
+                                network.synchronize(keychain, send)
+                            }) {
+                                eprintln!("hub-service-rs: failed to republish network shares: {error}");
+                            }
                         }
                     }
                 } else {
@@ -1187,6 +1278,34 @@ impl Core {
             Some(key) if !key.is_empty() => keychain.pin_hub_key(&self.address.pin_address(), key).is_ok(),
             _ => false,
         }
+    }
+
+    /// Runs a share operation with the keychain and a `network/shares/replace`
+    /// sender on `client` (`None` when not connected).
+    fn with_shares(
+        &self,
+        client: Option<&mut Client<()>>,
+        operation: impl FnOnce(
+            &mut NetworkPublisher,
+            &Keychain,
+            &mut dyn FnMut(Value) -> Result<Value, String>,
+        ) -> Result<Vec<SharePublication>, String>,
+    ) -> Result<Vec<SharePublication>, ServiceError> {
+        let client = client.ok_or(ServiceError::NotStarted)?;
+        let keychain = self
+            .keychain
+            .as_ref()
+            .ok_or_else(|| ServiceError::Network("share publishing needs the keychain, not a custom sign".into()))?;
+        let mut network = self
+            .network
+            .lock()
+            .map_err(|_| ServiceError::Network("share lock poisoned".into()))?;
+        let mut send = |body: Value| match client.sender().send::<Value, Value>("network/shares/replace", body) {
+            Ok(CallResult::Ok(value)) => Ok(value.unwrap_or(Value::Null)),
+            Ok(CallResult::RemoteErr(error)) => Err(error),
+            Err(error) => Err(error.to_string()),
+        };
+        operation(&mut network, keychain, &mut send).map_err(ServiceError::Network)
     }
 
     fn send_updates(&self, client: &mut Client<()>) {

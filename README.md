@@ -89,6 +89,12 @@ let response = service.send("echo/upper", json!("hello"))?; // "HELLO"
 - `forget_hub_key()` — drop this service's pin after the hub's key changed
 - `DeviceKey`, `Certifier`, `Certificate`, `encode_certificate`, `device_id`,
   `safety_code` — the device key file and service certificates
+- `share(NetworkShare)` before `start()`, `publish_share(share)`,
+  `remove_share(name)`, `share_publications()` — Hub Network shares (TS
+  `publishShare` parity): the local hub-net agent (`agent_socket`, default
+  `/var/run/hub-net/agent.sock` on macOS, `/run/hub-net/agent.sock` on Linux)
+  attests each local target and the hub publishes the declared set, again on
+  every reconnect
 - `post(path, handler)` / `post_with_settings(path, handler, ApiSettings)` /
   `stream(...)` — fluent; handlers take `serde_json::Value`
 - `post_request(path, handler)` / `stream_request(...)` (and `_with_settings`)
