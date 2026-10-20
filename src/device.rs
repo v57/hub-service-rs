@@ -19,7 +19,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Default certificate lifetime: 7 days.
 pub const CERTIFICATE_LIFETIME: u64 = 604_800;
@@ -114,7 +114,44 @@ pub fn platform() -> &'static str {
     }
 }
 
-/// The host name without a trailing `.local` (the default device name).
+/// False when `$HUB_DEVICE` turns device mode off (`0`, `off`, `false`, `no`).
+pub fn device_mode_enabled() -> bool {
+    match env::var("HUB_DEVICE") {
+        Ok(value) => !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// The default device name: `$HUB_DEVICE_NAME`, else the macOS computer
+/// name, else the host name.
+pub fn default_device_name() -> Option<String> {
+    static COMPUTER_NAME: OnceLock<Option<String>> = OnceLock::new();
+    if let Ok(name) = env::var("HUB_DEVICE_NAME") {
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    COMPUTER_NAME
+        .get_or_init(|| {
+            if !cfg!(target_os = "macos") {
+                return None;
+            }
+            let output = std::process::Command::new("scutil")
+                .args(["--get", "ComputerName"])
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (output.status.success() && !name.is_empty()).then_some(name)
+        })
+        .clone()
+        .or_else(host_name)
+}
+
+/// The host name without a trailing `.local`.
 pub fn host_name() -> Option<String> {
     #[cfg(unix)]
     {
@@ -188,6 +225,15 @@ impl DeviceKey {
         Some(Path::new(&home).join(".hub").join("device.key"))
     }
 
+    /// A caller-provided device key (key file text) for apps that keep it in
+    /// their own store; no file is read or created. Its path is empty.
+    pub fn from_key_file(key_file: &str) -> Result<Self, KeychainError> {
+        Ok(Self {
+            path: PathBuf::new(),
+            cached: Mutex::new(Some(keychain::parse(key_file, Path::new("<device key>"))?)),
+        })
+    }
+
     /// The key file path.
     pub fn path(&self) -> &Path {
         &self.path
@@ -227,8 +273,9 @@ pub struct Certifier {
 }
 
 impl Certifier {
-    /// `device_name` `None` uses the host name. `instance` is cut to 128
-    /// bytes, the names to 64.
+    /// `device_name` `None` uses [`default_device_name`], `parent` `None`
+    /// uses `$HUB_DEVICE_PARENT`. `instance` is cut to 128 bytes, the names
+    /// to 64.
     pub fn new(
         device_key: Arc<DeviceKey>,
         instance: &str,
@@ -240,11 +287,13 @@ impl Certifier {
             instance: truncate(instance, 128),
             device_name: device_name
                 .map(str::to_string)
-                .or_else(host_name)
+                .or_else(default_device_name)
                 .map(|name| truncate(&name, 64)),
             parent: parent
+                .map(str::to_string)
+                .or_else(|| env::var("HUB_DEVICE_PARENT").ok())
                 .filter(|parent| !parent.is_empty())
-                .map(|parent| truncate(parent, 64)),
+                .map(|parent| truncate(&parent, 64)),
             current: None,
         }
     }

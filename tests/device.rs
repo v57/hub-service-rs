@@ -3,7 +3,8 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use hub_service_rs::{
-    CERTIFICATE_LIFETIME, Certifier, DeviceKey, Keychain, Service, ServiceOptions, platform,
+    Address, CERTIFICATE_LIFETIME, Certifier, DeviceKey, Keychain, Service, ServiceOptions,
+    normalize_hub_address, platform,
 };
 use serde_json::Value;
 use std::fs;
@@ -112,18 +113,18 @@ fn instance_defaults() {
         disable_device: true,
         ..ServiceOptions::default()
     };
-    assert_eq!(Service::new(options()).instance(), "service");
+    // cargo runs tests in the package directory; $HUB_INSTANCE is unset here.
+    if std::env::var("HUB_INSTANCE").is_err() {
+        let mut service = Service::new(options());
+        service.post("s3/read", Ok);
+        assert_eq!(service.instance(), "hub-service-rs");
 
-    let mut service = Service::new(options());
-    service.post("s3/read", Ok).post("a/b", Ok);
-    assert_eq!(service.instance(), "s3");
-
-    let mut service = Service::new(ServiceOptions {
-        name: Some("Backup Disk".into()),
-        ..options()
-    });
-    service.post("s3/read", Ok);
-    assert_eq!(service.instance(), "Backup Disk");
+        let service = Service::new(ServiceOptions {
+            name: Some("Backup Disk".into()),
+            ..options()
+        });
+        assert_eq!(service.instance(), "Backup Disk");
+    }
 
     let service = Service::new(ServiceOptions {
         name: Some("Backup Disk".into()),
@@ -131,4 +132,39 @@ fn instance_defaults() {
         ..options()
     });
     assert_eq!(service.instance(), "s3-local/Backup Disk");
+}
+
+#[test]
+fn caller_provided_device_key_reads_no_file() {
+    const KEY_FILE: &str = "MC4CAQAwBQYDK2VwBCIEIAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDMCowBQYDK2VwAyEA7UkoxijRwsbq6QM4kFmVYSlZJzpcY/k2NsFGFKyHN9E=";
+    let key = Arc::new(DeviceKey::from_key_file(KEY_FILE).unwrap());
+    assert_eq!(
+        key.public_key().unwrap(),
+        "MCowBQYDK2VwAyEA7UkoxijRwsbq6QM4kFmVYSlZJzpcY/k2NsFGFKyHN9E="
+    );
+    let mut certifier = Certifier::new(key, "x", Some("n"), None);
+    let header = certifier.header("S", 1).unwrap();
+    assert_eq!(
+        payload(&header)["device"],
+        "MCowBQYDK2VwAyEA7UkoxijRwsbq6QM4kFmVYSlZJzpcY/k2NsFGFKyHN9E="
+    );
+    assert!(DeviceKey::from_key_file("bm90LWEta2V5").is_err());
+}
+
+#[test]
+fn pin_addresses_are_normalized() {
+    assert_eq!(normalize_hub_address("1997"), "ws://localhost:1997");
+    assert_eq!(
+        normalize_hub_address("WSS://Hub.Example.COM/"),
+        "wss://hub.example.com"
+    );
+    assert_eq!(
+        normalize_hub_address("ws://Host:80/Path/"),
+        "ws://host:80/Path"
+    );
+    assert_eq!(Address::Port(1997).pin_address(), "ws://localhost:1997");
+    assert_eq!(
+        Address::Url("ws://Example:2000/".into()).pin_address(),
+        "ws://example:2000"
+    );
 }

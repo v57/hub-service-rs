@@ -126,7 +126,7 @@ fn learns_and_pins_the_hub_key_then_connects_with_v1() {
     assert_eq!(connects.len(), 2, "v0 connect, then a v1 reconnect");
     assert_eq!(connects[0]["v"], "0");
     assert_eq!(connects[1]["v"], "1");
-    let address = format!("ws://127.0.0.1:{}", hub.server.port());
+    let address = format!("ws://localhost:{}", hub.server.port());
     assert_eq!(keychain.hub_key(&address).as_deref(), Some(HUB_KEY));
 
     // The v1 token signs hub1:<hub key>:<expiry> with the service key.
@@ -145,7 +145,7 @@ fn pinned_hub_connects_once_with_v1() {
     let keychain = Arc::new(Keychain::with_path(dir.join("auth")));
     let mut hub = FakeHub::start(true);
     keychain
-        .pin_hub_key(&format!("ws://127.0.0.1:{}", hub.server.port()), HUB_KEY)
+        .pin_hub_key(&format!("ws://localhost:{}", hub.server.port()), HUB_KEY)
         .unwrap();
     let mut service = service_for(&hub, &keychain);
     service.start();

@@ -13,7 +13,8 @@ directory and attaches a freshly signed `key.<pub>.<sig>.<expiry>` token as the
 raw `auth`/`v` header block on EVERY (re)connect — hub-lite ignores the headers
 entirely, so the port stays regression-safe. On the first connection to a hub
 it asks `hub/info` for the hub key, pins it in `hubs.json` beside the key file
-and reconnects with a v1 token that only that hub accepts. Unless
+(keyed by the address, a bare port as `ws://localhost:<port>`) and reconnects
+with a v1 token that only that hub accepts. Unless
 `disable_device` is set, every connect also sends a `device` header: a
 certificate for the service key signed by the device key (`~/.hub/device.key`,
 `/var/lib/hub/device.key` for root, or `$HUB_DEVICE_KEY`; created on first
@@ -80,9 +81,11 @@ let response = service.send("echo/upper", json!("hello"))?; // "HELLO"
   `sign_for_hub(hub_key, expires)` (v1) → `key.<pub>.<sig>.<expiry>`,
   `public_key()`, `hub_key` / `pin_hub_key` / `forget_hub_key(address)`;
   `auth_token(key_file, hub_key, expiry)`, `connect_header_block(token, v, device)`
-  Device options: `instance` (default: `name`, else the first path segment),
-  `device_name` (default: the host name), `parent`, `device_key`,
-  `disable_device`
+  Device options: `instance` (default: `$HUB_INSTANCE`, else `name`, else the
+  working directory's name), `device_name` (default: `$HUB_DEVICE_NAME`, else
+  the computer name), `parent` (`$HUB_DEVICE_PARENT`), `device_key`
+  (`DeviceKey::from_key_file` for a key kept elsewhere), `disable_device`
+  (`$HUB_DEVICE=0`)
 - `forget_hub_key()` — drop this service's pin after the hub's key changed
 - `DeviceKey`, `Certifier`, `Certificate`, `encode_certificate`, `device_id`,
   `safety_code` — the device key file and service certificates

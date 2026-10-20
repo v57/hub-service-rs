@@ -32,8 +32,8 @@ pub use channel_rs::*;
 mod device;
 mod keychain;
 pub use device::{
-    CERTIFICATE_LIFETIME, CERTIFICATE_RENEW, Certificate, Certifier, DeviceKey, device_id,
-    encode_certificate, host_name, platform, safety_code,
+    CERTIFICATE_LIFETIME, CERTIFICATE_RENEW, Certificate, Certifier, DeviceKey, default_device_name,
+    device_id, device_mode_enabled, encode_certificate, host_name, platform, safety_code,
 };
 pub use keychain::{AUTH_EXPIRY, Keychain, KeychainError, auth_token};
 
@@ -86,17 +86,21 @@ pub struct ServiceOptions {
     /// [`Keychain::new`], the `auth` file in the cwd or `$HUBKEY`).
     pub keychain: Option<Arc<Keychain>>,
     /// Instance name in the device certificate, unique per device
-    /// (`s3-local/Backup Disk`). Default: `name`, else the first segment of
-    /// the first registered path, else `service`.
+    /// (`s3-local/Backup Disk`). Default: `$HUB_INSTANCE`, else `name`, else
+    /// the basename of the working directory, else `service`.
     pub instance: Option<String>,
-    /// Suggested device name in the certificate. Default: the host name.
+    /// Suggested device name in the certificate. Default: `$HUB_DEVICE_NAME`,
+    /// else the macOS computer name, else the host name.
     pub device_name: Option<String>,
-    /// Declared parent device name, for containers and VMs.
+    /// Declared parent device name, for containers and VMs. Default:
+    /// `$HUB_DEVICE_PARENT`.
     pub parent: Option<String>,
     /// The device key (default: [`DeviceKey::new`], `~/.hub/device.key` or
-    /// `$HUB_DEVICE_KEY`).
+    /// `$HUB_DEVICE_KEY`). Apps that keep it in their own store pass
+    /// [`DeviceKey::from_key_file`].
     pub device_key: Option<Arc<DeviceKey>>,
     /// No device key and no `device` header: a plain key connection.
+    /// `$HUB_DEVICE=0` (or `off`, `false`, `no`) does the same.
     pub disable_device: bool,
 }
 
@@ -135,13 +139,35 @@ impl Clone for ServiceOptions {
 }
 
 impl Address {
-    /// The address as a URL: a port becomes `ws://127.0.0.1:<port>`. Hub key
-    /// pins are stored under it.
-    pub fn url(&self) -> String {
+    /// The key of this address's hub key pin (see [`normalize_hub_address`]).
+    pub fn pin_address(&self) -> String {
         match self {
-            Address::Port(port) => format!("ws://127.0.0.1:{port}"),
-            Address::Url(url) => url.clone(),
+            Address::Port(port) => normalize_hub_address(&port.to_string()),
+            Address::Url(url) => normalize_hub_address(url),
         }
+    }
+}
+
+/// A hub address normalized for hub key pins (protocol.md section 2): a bare
+/// port `1997` becomes `ws://localhost:1997`; otherwise the URL as given with
+/// the scheme and host lowercased and no trailing slash.
+pub fn normalize_hub_address(address: &str) -> String {
+    if !address.is_empty() && address.bytes().all(|byte| byte.is_ascii_digit()) {
+        return format!("ws://localhost:{address}");
+    }
+    let trimmed = address.trim_end_matches('/');
+    match trimmed.find("://") {
+        Some(scheme_end) => {
+            let rest = &trimmed[scheme_end + 3..];
+            let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            format!(
+                "{}://{}{}",
+                trimmed[..scheme_end].to_ascii_lowercase(),
+                rest[..authority_end].to_ascii_lowercase(),
+                &rest[authority_end..]
+            )
+        }
+        None => trimmed.to_string(),
     }
 }
 
@@ -618,7 +644,6 @@ pub struct Service {
     device_name: Option<String>,
     parent: Option<String>,
     device_key: Option<Arc<DeviceKey>>,
-    first_path: Option<String>,
     apps: Vec<AppHeader>,
     paths: BTreeSet<String>,
     settings: HashMap<String, ApiSettings>,
@@ -646,7 +671,7 @@ impl Service {
             Some(_) => None,
             None => Some(options.keychain.clone().unwrap_or_else(|| Arc::new(Keychain::new()))),
         };
-        let device_key = match options.disable_device {
+        let device_key = match options.disable_device || !device_mode_enabled() {
             true => None,
             false => options.device_key.clone().or_else(|| DeviceKey::new().map(Arc::new)),
         };
@@ -658,7 +683,6 @@ impl Service {
             device_name: options.device_name.clone(),
             parent: options.parent.clone(),
             device_key,
-            first_path: None,
             profile,
             apps: Vec::new(),
             paths: BTreeSet::new(),
@@ -792,21 +816,18 @@ impl Service {
     }
 
     /// The instance name in the device certificate: the `instance` option,
-    /// else the profile name, else the first segment of the first registered
-    /// path, else `service`.
+    /// else `$HUB_INSTANCE`, else the profile name, else the basename of the
+    /// working directory, else `service`.
     pub fn instance(&self) -> String {
-        if let Some(instance) = self.instance.as_ref().filter(|instance| !instance.is_empty()) {
-            return instance.clone();
-        }
-        if let Some(name) = self.profile.as_ref().and_then(|profile| profile.name.clone()) {
-            if !name.is_empty() {
-                return name;
-            }
-        }
-        match self.first_path.as_deref().and_then(|path| path.split('/').next()) {
-            Some(segment) if !segment.is_empty() => segment.to_string(),
-            _ => "service".to_string(),
-        }
+        let name = self.profile.as_ref().and_then(|profile| profile.name.clone());
+        let directory = env::current_dir()
+            .ok()
+            .and_then(|dir| dir.file_name().map(|name| name.to_string_lossy().into_owned()));
+        [self.instance.clone(), env::var("HUB_INSTANCE").ok(), name, directory]
+            .into_iter()
+            .flatten()
+            .find(|instance| !instance.is_empty())
+            .unwrap_or_else(|| "service".to_string())
     }
 
     /// Forgets the hub key pinned for this service's address. Use it when a
@@ -814,7 +835,7 @@ impl Service {
     /// key changed on purpose; the next connect learns it again.
     pub fn forget_hub_key(&self) -> Result<(), KeychainError> {
         match &self.keychain {
-            Some(keychain) => keychain.forget_hub_key(&self.address.url()),
+            Some(keychain) => keychain.forget_hub_key(&self.address.pin_address()),
             None => Ok(()),
         }
     }
@@ -896,9 +917,6 @@ impl Service {
     }
 
     fn add_path(&mut self, path: &str, mut settings: ApiSettings) {
-        if self.first_path.is_none() {
-            self.first_path = Some(path.to_string());
-        }
         self.paths.insert(path.to_string());
         if let Some(permissions) = settings.permissions.as_mut() {
             if permissions.group.is_empty() {
@@ -1126,7 +1144,7 @@ impl Core {
             return (!token.is_empty()).then(|| auth_header_block(&token));
         }
         let keychain = self.keychain.as_ref()?;
-        let hub_key = keychain.hub_key(&self.address.url());
+        let hub_key = keychain.hub_key(&self.address.pin_address());
         self.hub_key_known = hub_key.is_some();
         // A keychain failure logs and connects without auth headers rather
         // than killing the service thread.
@@ -1166,7 +1184,7 @@ impl Core {
             return false;
         };
         match info.get("key").and_then(Value::as_str) {
-            Some(key) if !key.is_empty() => keychain.pin_hub_key(&self.address.url(), key).is_ok(),
+            Some(key) if !key.is_empty() => keychain.pin_hub_key(&self.address.pin_address(), key).is_ok(),
             _ => false,
         }
     }
