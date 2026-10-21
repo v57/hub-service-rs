@@ -7,7 +7,7 @@ Rust port of [hub-service](https://github.com/v57/hub-service) — connect to a
 [hub](https://github.com/v57/hub-lite) (default `ws://127.0.0.1:1997`), host
 your own post/stream API endpoints, register apps, and call API through the hub.
 
-Hub-pro auth (TS keychain parity, `Hub/Docs/Devices/protocol.md`): the
+hub-server auth (TS keychain parity, `Hub/Docs/Devices/protocol.md`): the
 service loads-or-generates the ed25519 `auth` key file in the working
 directory and attaches a freshly signed `key.<pub>.<sig>.<expiry>` token as the
 raw `auth`/`v` header block on EVERY (re)connect — hub-lite ignores the headers

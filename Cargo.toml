@@ -3,7 +3,7 @@ name = "hub-service-rs"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Rust port of hub-service: connect to a hub, host post/stream API endpoints, register apps, hub-pro auth (ed25519 keychain)."
+description = "Rust port of hub-service: connect to a hub, host post/stream API endpoints, register apps, hub-server auth (ed25519 keychain)."
 
 [dependencies]
 channel-rs = { path = "../../Channel/channel-rs/crates/channel-rs" }

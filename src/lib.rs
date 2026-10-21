@@ -1,9 +1,9 @@
 //! hub-service-rs — Rust port of [hub-service](https://github.com/v57/hub-service).
 //!
-//! Connect to a hub (hub-lite / hub-pro), host post/stream API endpoints,
+//! Connect to a hub (hub-lite / hub-server), host post/stream API endpoints,
 //! register apps, and call API through the hub.
 //!
-//! Hub-pro auth (TS keychain parity, `Docs/Devices/protocol.md`): the
+//! hub-server auth (TS keychain parity, `Docs/Devices/protocol.md`): the
 //! service loads-or-generates the ed25519 `auth` key file in the cwd and
 //! attaches a freshly signed `key.<pub>.<sig>.<expiry>` token as the raw
 //! `auth`/`v` header block on EVERY (re)connect (hub-lite ignores the headers
@@ -85,7 +85,7 @@ pub struct ServiceOptions {
     pub name: Option<String>,
     /// Profile icon: a string or `{"symbol": ..., "text": ...}`.
     pub icon: Option<Value>,
-    /// Optional v0 token factory for hub-pro auth, replacing the keychain.
+    /// Optional v0 token factory for hub-server auth, replacing the keychain.
     /// The returned token is attached as the raw `auth` header on every
     /// (re)connect; an empty string connects without auth headers. No hub
     /// key is learned or pinned with a custom factory.
@@ -1204,7 +1204,7 @@ impl Core {
                 continue;
             }
             if client.is_none() {
-                // Fresh hub-pro auth token per connect (expiry changes): the
+                // Fresh hub-server auth token per connect (expiry changes): the
                 // raw header block is attached to the HTTP upgrade request.
                 let headers = self.connect_headers();
                 let options = ConnectOptions {

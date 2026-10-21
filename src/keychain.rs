@@ -1,7 +1,7 @@
 //! ed25519 keychain: load-or-generate the `auth` key file, sign tokens and
 //! pin hub keys.
 //!
-//! Hub-pro auth parity with the TS reference (hub-service/keychain.ts) and
+//! hub-server auth parity with the TS reference (hub-service/keychain.ts) and
 //! `Docs/Devices/protocol.md` section 2:
 //!
 //! - The key file (`auth` in the working directory, matching the TS keychain;
@@ -14,7 +14,7 @@
 //!     sig     = base64 ed25519 signature over
 //!                 v0: `<expiry>`
 //!                 v1: `hub1:<hub SPKI>:<expiry>` (only valid on that hub)
-//!     expiry  = DECIMAL epoch-seconds string of now + 60; hub-pro rejects
+//!     expiry  = DECIMAL epoch-seconds string of now + 60; hub-server rejects
 //!               it once 30 s past or more than 330 s ahead
 //! - The hub verifies the signature against the embedded public key and
 //!   treats the key as the connection identity (owner/host/group).
