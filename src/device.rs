@@ -93,10 +93,12 @@ pub fn device_id(spki: &str) -> Option<String> {
     Some(spki_digest(spki)?[..32].to_string())
 }
 
-/// The safety code shown when approving a device: `"ddd ddd"`.
-pub fn safety_code(spki: &str) -> Option<String> {
-    let n = u64::from_str_radix(&spki_digest(spki)?[..8], 16).ok()? % 1_000_000;
-    Some(format!("{:03} {:03}", n / 1000, n % 1000))
+/// The safety code shown when approving a device: `"ddd ddd"`. `hub_key` is the key this side pinned, `code_value` what
+/// the hub picked after it had the device's key (`hub/device/request`).
+pub fn safety_code(hub_key: &str, device_key: &str, code_value: &str) -> String {
+    let digest = Sha256::digest(format!("hubcode1:{hub_key}:{device_key}:{code_value}").as_bytes());
+    let n = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    format!("{:03} {:03}", n / 1000, n % 1000)
 }
 
 /// This OS as a certificate platform.

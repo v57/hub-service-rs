@@ -124,10 +124,10 @@ fn device_id_and_safety_code() {
         device_id(key).as_deref(),
         Some(text(&v, "/keys/device/deviceId"))
     );
-    assert_eq!(
-        safety_code(key).as_deref(),
-        Some(text(&v, "/keys/device/safetyCode"))
-    );
+    for index in 0..v["safetyCode"]["cases"].as_array().unwrap().len() {
+        let field = |name: &str| text(&v, &format!("/safetyCode/cases/{index}/{name}")).to_string();
+        assert_eq!(safety_code(&field("hubKey"), &field("deviceKey"), &field("codeValue")), field("code"));
+    }
 }
 
 #[test]
