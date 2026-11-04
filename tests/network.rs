@@ -1,6 +1,8 @@
 //! Hub Network share publishing against a fake hub-net agent (HTTP on a Unix
 //! socket, in a thread) and an in-process fake hub (a channel-rs server).
 
+mod common;
+
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use channel_rs::{Channel, ListenOptions, PostRequest, Server};
@@ -196,6 +198,10 @@ impl FakeHub {
         let mut channel = Channel::<HubState>::new();
         channel
             .post::<Value, Value, (), _>("hub/service/update", |_| Ok(None))
+            .unwrap()
+            .post::<Value, Value, (), _>("hub/info", |request: PostRequest<'_, HubState, Value, ()>| {
+                Ok(Some(common::answer(&common::HUB_SEED, common::HUB_KEY, &request.body, "challenge")))
+            })
             .unwrap()
             .post::<Value, Value, (), _>(
                 "network/shares/replace",

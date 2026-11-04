@@ -48,7 +48,7 @@ async fn main() {
                 .data(json!({"hello": "world"})),
         )
         .start();
-    println!("echo service started (hub-lite :1997)");
+    println!("echo service started (hub on :1997)");
     loop {
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }

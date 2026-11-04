@@ -7,14 +7,16 @@ Rust port of [hub-service](https://github.com/v57/hub-service) — connect to a
 [hub](https://github.com/v57/hub-lite) (default `ws://127.0.0.1:1997`), host
 your own post/stream API endpoints, register apps, and call API through the hub.
 
-hub-server auth (TS keychain parity, `Hub/Docs/Devices/protocol.md`): the
+hub-server auth (TS keychain parity, `Hub/Docs/Devices/protocol.md` section 2): the
 service loads-or-generates the ed25519 `auth` key file in the working
-directory and attaches a freshly signed `key.<pub>.<sig>.<expiry>` token as the
-raw `auth`/`v` header block on EVERY (re)connect — hub-lite ignores the headers
-entirely, so the port stays regression-safe. On the first connection to a hub
-it asks `hub/info` for the hub key, pins it in `hubs.json` beside the key file
-(keyed by the address, a bare port as `ws://localhost:<port>`) and reconnects
-with a v1 token that only that hub accepts. Unless
+directory. Every (re)connect asks the hub to prove its key on a short anonymous
+connection, then attaches a fresh `key.<pub>.<sig>.<expiry>.<nonce>` token as the
+raw `auth`/`v` header block. The first proven key is pinned in `hubs.json` beside
+the key file (keyed by the address, a bare port as `ws://localhost:<port>`). A hub
+that doesn't prove its key, or proves another than the pinned one, gets nothing and
+is reported while the service keeps trying, so calls wait instead of failing. Plain
+`ws://` beyond loopback, the overlay and the LAN isn't dialed unless `allow_plaintext`
+or `HUB_ALLOW_PLAINTEXT=1` says so. Unless
 `disable_device` is set, every connect also sends a `device` header: a
 certificate for the service key signed by the device key (`~/.hub/device.key`,
 `/var/lib/hub/device.key` for root, or `$HUB_DEVICE_KEY`; created on first
@@ -32,7 +34,7 @@ Requires [channel-rs](https://github.com/v57/channel-rs) and a tokio runtime
 
 ## Usage
 
-Start a hub first (`new Hub()` from hub-lite, listens on 1997), then:
+Start a hub first (hub-server, listens on 1997), then:
 
 ```rust
 use hub_service_rs::{Action, App, AppHeader, Service, ServiceOptions};
@@ -75,18 +77,24 @@ let response = service.send("echo/upper", json!("hello"))?; // "HELLO"
 
 - `Service::new(ServiceOptions)` — `address` (port or ws:// URL; default
   `1997` or `$HUB`), `name`, `icon`, `keychain` (default: `Keychain` reading
-  `auth` in the cwd, or `$HUBKEY`), `sign` (optional v0 token factory that
-  replaces the keychain)
-- `Keychain` / `KeychainError` — `sign(expires)` (v0) and
-  `sign_for_hub(hub_key, expires)` (v1) → `key.<pub>.<sig>.<expiry>`,
-  `public_key()`, `hub_key` / `pin_hub_key` / `forget_hub_key(address)`;
-  `auth_token(key_file, hub_key, expiry)`, `connect_header_block(token, v, device)`
+  `auth` in the cwd, or `$HUBKEY`), `sign` (optional token factory given the
+  proven hub key and the challenge; turns off device mode), `allow_plaintext`
+  (dial plain `ws://` beyond loopback, the overlay and the LAN; also
+  `HUB_ALLOW_PLAINTEXT=1`)
+- `Keychain` / `KeychainError` — `sign_for_hub(hub_key, nonce, expires)` and
+  `sign_default(hub_key, nonce)` → `key.<pub>.<sig>.<expiry>.<nonce>` for one
+  connection (30 s), `public_key()`, `hub_key` / `pin_hub_key` /
+  `forget_hub_key(address)`; `auth_token(key_file, hub_key, nonce, expiry)`,
+  `connect_header_block(token, device)`
+- `hub_transport_of(address)`, `HubInfo`, `hub_info_signed_data`,
+  `make_client_nonce` — the transport classes and the hub's proof
   Device options: `instance` (default: `$HUB_INSTANCE`, else `name`, else the
   working directory's name), `device_name` (default: `$HUB_DEVICE_NAME`, else
   the computer name), `parent` (`$HUB_DEVICE_PARENT`), `device_key`
   (`DeviceKey::from_key_file` for a key kept elsewhere), `disable_device`
   (`$HUB_DEVICE=0`)
-- `forget_hub_key()` — drop this service's pin after the hub's key changed
+- `hub_key()` / `forget_hub_key()` — this service's pin; drop it after the hub's
+  key changed
 - `DeviceKey`, `Certifier`, `Certificate`, `encode_certificate`, `device_id`,
   `safety_code` — the device key file and service certificates
 - `share(NetworkShare)` before `start()`, `publish_share(share)`,
@@ -100,18 +108,21 @@ let response = service.send("echo/upper", json!("hello"))?; // "HELLO"
 - `post_request(path, handler)` / `stream_request(...)` (and `_with_settings`)
   — handlers take a `Request { body, caller, context }`; `caller` is the hub's
   `Caller { key, device, groups, owner, via, claimed, hub_key }`, `None` when
-  the call carries no hub caller (hub-lite)
+  the call carries no hub caller
 - `app(App)` — register app header + `AppInterface` stream at `header.path`
 - `send(path, body)` / `values(path, body)` — client calls through the hub
 - `start()` — connect + poll thread; detects `is_connected` false→true per
   connection and re-sends `hub/profile/update` then `hub/service/update`
 
 `ApiSettings` carries `Permissions` (group auto-filled from the first path
-segment, TS parity) and `Limit` — wire-parity fields that hub-lite ignores.
+segment, TS parity) and `Limit`.
 
 Note: channel-rs's client `ConnectOptions` has no `on_connect` callback, so
 `start()` spawns a poll thread (`Client::poll()`) and sends the update messages
-on each `is_connected()` transition.
+on each `is_connected()` transition. Its client has no TLS and this crate builds
+it without QUIC, so `wss://` and `quic://` addresses pass the transport check but
+fail to connect (reported, and retried). There is no `stop`: the poll thread runs
+for the life of the process.
 
 ## Test
 

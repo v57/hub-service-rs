@@ -8,14 +8,14 @@
 //!   `$HUBKEY` overrides the path) is the base64 encoding of the 48-byte
 //!   PKCS8 DER ed25519 private key followed by the 44-byte SPKI DER public
 //!   key (92 bytes total, 124 base64 chars).
-//! - A signed token has the shape `key.<pub>.<sig>.<expiry>` where:
+//! - A signed token has the shape `key.<pub>.<sig>.<expiry>.<nonce>` where:
 //!     pub     = base64 of the 44-byte SPKI public key (bytes 48..92 of the
 //!               file)
+//!     nonce   = the challenge the hub answered in `hub/info`
 //!     sig     = base64 ed25519 signature over
-//!                 v0: `<expiry>`
-//!                 v1: `hub1:<hub SPKI>:<expiry>` (only valid on that hub)
-//!     expiry  = DECIMAL epoch-seconds string of now + 60; hub-server rejects
-//!               it once 30 s past or more than 330 s ahead
+//!               `hub1:<hub SPKI>:<nonce>:<expiry>` (one connection to one hub)
+//!     expiry  = DECIMAL epoch-seconds string of now + 30; hub-server rejects
+//!               it once 30 s past or more than 90 s ahead
 //! - The hub verifies the signature against the embedded public key and
 //!   treats the key as the connection identity (owner/host/group).
 //! - Hub key pins live in `hubs.json` beside the key file:
@@ -24,11 +24,12 @@
 //! Usage:
 //!
 //! ```no_run
-//! use hub_service_rs::{Keychain, auth_header_block};
+//! use hub_service_rs::{Keychain, connect_header_block};
 //!
 //! let keychain = Keychain::new(); // loads or generates `auth` in the cwd
-//! let token = keychain.sign_default()?; // fresh v0 token for a connect
-//! let headers = auth_header_block(&token); // raw "auth: ...\r\nv: 0\r\n"
+//! // The hub's proven key and challenge, from its `hub/info` answer.
+//! let token = keychain.sign_default("<hub key>", "<challenge>")?;
+//! let headers = connect_header_block(&token, None); // raw "auth: ...\r\nv: 1\r\n"
 //! # Ok::<(), hub_service_rs::KeychainError>(())
 //! ```
 
@@ -46,8 +47,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Seconds a fresh token stays valid (protocol.md: SDK default now + 60).
-pub const AUTH_EXPIRY: u64 = 60;
+/// Seconds a fresh token stays valid (protocol.md: SDK default now + 30; a
+/// token is for one connect, and hubs accept at most 60 s).
+pub const AUTH_EXPIRY: u64 = 30;
 
 /// TS keychain layout: PKCS8 DER private key (48 bytes for ed25519) followed
 /// by the SPKI DER public key (44 bytes for ed25519).
@@ -61,7 +63,7 @@ const PUBLIC_DER_LENGTH: usize = 44;
 const PKCS8_PREFIX: [u8; 16] = [
     0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
 ];
-const SPKI_PREFIX: [u8; 12] = [
+pub(crate) const SPKI_PREFIX: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
 
@@ -108,23 +110,21 @@ impl KeyData {
         B64.encode(signature.to_bytes())
     }
 
-    fn token(&self, hub_key: Option<&str>, expiry: u64) -> String {
-        let data = match hub_key {
-            Some(hub_key) => format!("hub1:{hub_key}:{expiry}"),
-            None => expiry.to_string(),
-        };
-        format!("key.{}.{}.{expiry}", self.public_key(), self.sign(&data))
+    fn token(&self, hub_key: &str, nonce: &str, expiry: u64) -> String {
+        let signature = self.sign(&format!("hub1:{hub_key}:{nonce}:{expiry}"));
+        format!("key.{}.{signature}.{expiry}.{nonce}", self.public_key())
     }
 }
 
-/// An auth token for an explicit key file text and expiry (for tests and
-/// tools): `hub_key` `None` signs v0, otherwise v1.
+/// An auth token for an explicit key file text, hub challenge and expiry (for
+/// tests and tools).
 pub fn auth_token(
     key_file: &str,
-    hub_key: Option<&str>,
+    hub_key: &str,
+    nonce: &str,
     expiry: u64,
 ) -> Result<String, KeychainError> {
-    Ok(parse(key_file, Path::new("<text>"))?.token(hub_key, expiry))
+    Ok(parse(key_file, Path::new("<text>"))?.token(hub_key, nonce, expiry))
 }
 
 pub(crate) fn now_seconds() -> Result<u64, KeychainError> {
@@ -135,7 +135,7 @@ pub(crate) fn now_seconds() -> Result<u64, KeychainError> {
 }
 
 /// ed25519 keychain (TS `keychain.ts` parity): load-or-generate the `auth`
-/// key file, sign `key.<pub>.<sig>.<expiry>` tokens and keep hub key pins.
+/// key file, sign `key.<pub>.<sig>.<expiry>.<nonce>` tokens and keep hub key pins.
 ///
 /// The key material is loaded lazily on first use and cached; safe to share
 /// across threads (the service re-signs on every reconnect).
@@ -170,26 +170,23 @@ impl Keychain {
         Ok(self.data()?.public_key())
     }
 
-    /// A fresh v0 auth token: `key.<pub>.<sig>.<expiry>` with
+    /// A fresh token for one connection to the hub with key `hub_key`, over
+    /// the challenge it answered in `hub/info`: the signature covers
+    /// `hub1:<hub key>:<nonce>:<expiry>`, with
     /// `expiry = now_epoch_seconds + expires` (decimal string, TS parity).
-    pub fn sign(&self, expires: u64) -> Result<String, KeychainError> {
-        self.sign_for_hub(None, expires)
-    }
-
-    /// A fresh token bound to `hub_key` (v1: the signature covers
-    /// `hub1:<hub key>:<expiry>`); `None` signs v0.
     pub fn sign_for_hub(
         &self,
-        hub_key: Option<&str>,
+        hub_key: &str,
+        nonce: &str,
         expires: u64,
     ) -> Result<String, KeychainError> {
         let data = self.data()?;
-        Ok(data.token(hub_key, now_seconds()? + expires))
+        Ok(data.token(hub_key, nonce, now_seconds()? + expires))
     }
 
-    /// `sign(AUTH_EXPIRY)`.
-    pub fn sign_default(&self) -> Result<String, KeychainError> {
-        self.sign(AUTH_EXPIRY)
+    /// `sign_for_hub(hub_key, nonce, AUTH_EXPIRY)`.
+    pub fn sign_default(&self, hub_key: &str, nonce: &str) -> Result<String, KeychainError> {
+        self.sign_for_hub(hub_key, nonce, AUTH_EXPIRY)
     }
 
     /// The hub key pinned for `address`, if any.
@@ -204,8 +201,8 @@ impl Keychain {
         self.write_pins(&pins)
     }
 
-    /// Removes the pin for `address`: connects use v0 again until hub/info
-    /// pins the key again. Use it when the hub's key changed on purpose.
+    /// Removes the pin for `address`: the next connect pins what the hub
+    /// proves. Use it when the hub's key changed on purpose.
     pub fn forget_hub_key(&self, address: &str) -> Result<(), KeychainError> {
         let mut pins = self.read_pins();
         if pins.remove(address).is_none() {

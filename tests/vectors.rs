@@ -1,7 +1,10 @@
 //! Device layer test vectors (`Docs/Devices/vectors.json`): every SDK must
 //! reproduce these strings exactly.
 
-use hub_service_rs::{Caller, Certificate, auth_token, device_id, encode_certificate, safety_code};
+use hub_service_rs::{
+    Caller, Certificate, HubInfo, auth_token, device_id, encode_certificate, hub_info_signed_data,
+    hub_transport_of, safety_code,
+};
 use serde_json::Value;
 
 fn vectors() -> Value {
@@ -21,24 +24,49 @@ fn text<'a>(vectors: &'a Value, pointer: &str) -> &'a str {
 }
 
 #[test]
-fn auth_v0() {
-    let v = vectors();
-    let expiry = v.pointer("/auth/expiry").and_then(Value::as_u64).unwrap();
-    let token = auth_token(text(&v, "/keys/service/keyFile"), None, expiry).unwrap();
-    assert_eq!(token, text(&v, "/auth/v0/header"));
-}
-
-#[test]
 fn auth_v1() {
     let v = vectors();
     let expiry = v.pointer("/auth/expiry").and_then(Value::as_u64).unwrap();
     let token = auth_token(
         text(&v, "/keys/service/keyFile"),
-        Some(text(&v, "/keys/hub/publicKey")),
+        text(&v, "/keys/hub/publicKey"),
+        text(&v, "/auth/nonce"),
         expiry,
     )
     .unwrap();
     assert_eq!(token, text(&v, "/auth/v1/header"));
+}
+
+#[test]
+fn hub_info_proof() {
+    let v = vectors();
+    let key = text(&v, "/keys/hub/publicKey");
+    let nonce = text(&v, "/hubInfo/nonce");
+    assert_eq!(hub_info_signed_data(key, nonce), text(&v, "/hubInfo/signedData"));
+    let mut info = HubInfo {
+        key: key.to_string(),
+        proof: text(&v, "/hubInfo/proof").to_string(),
+        challenge: "c".to_string(),
+    };
+    assert!(info.proves(nonce));
+    assert!(!info.proves("another-nonce-another-nonce"), "another nonce");
+    info.key = text(&v, "/keys/service/publicKey").to_string();
+    assert!(!info.proves(nonce), "another key");
+}
+
+#[test]
+fn transport() {
+    let v = vectors();
+    let cases = v.pointer("/transport").and_then(Value::as_array).unwrap();
+    assert!(!cases.is_empty());
+    for case in cases {
+        let url = case["url"].as_str().unwrap();
+        assert_eq!(hub_transport_of(url).as_str(), case["transport"], "{url}");
+    }
+    assert_eq!(hub_transport_of("1997").as_str(), "loopback");
+    assert_eq!(hub_transport_of("hub:1997").as_str(), "refused");
+    assert_eq!(hub_transport_of("WS://LOCALHOST.:1997").as_str(), "loopback");
+    assert_eq!(hub_transport_of("ws://me@10.0.0.2:1997/x").as_str(), "localNetwork");
 }
 
 fn check_certificate(

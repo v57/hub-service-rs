@@ -1,41 +1,44 @@
 //! hub-service-rs — Rust port of [hub-service](https://github.com/v57/hub-service).
 //!
-//! Connect to a hub (hub-lite / hub-server), host post/stream API endpoints,
-//! register apps, and call API through the hub.
+//! Connect to a hub (hub-server), host post/stream API endpoints, register
+//! apps, and call API through the hub.
 //!
-//! hub-server auth (TS keychain parity, `Docs/Devices/protocol.md`): the
-//! service loads-or-generates the ed25519 `auth` key file in the cwd and
-//! attaches a freshly signed `key.<pub>.<sig>.<expiry>` token as the raw
-//! `auth`/`v` header block on EVERY (re)connect (hub-lite ignores the headers
-//! entirely, so the port stays regression-safe). With no hub key pinned for
-//! the address it connects with v0, asks `hub/info` for the hub key, pins it
-//! in `hubs.json` and reconnects with a v1 token bound to that hub. Unless
-//! disabled, every connect also sends a certificate for the service key
-//! signed by the device key (see [`DeviceKey`]), renewed when less than a day
-//! is left. The wire
+//! hub-server auth (TS keychain parity, `Docs/Devices/protocol.md` section 2):
+//! the service loads-or-generates the ed25519 `auth` key file in the cwd.
+//! Before EVERY (re)connect it asks `hub/info` with a fresh nonce on a short
+//! anonymous connection. Only an answer with a valid proof of the key it claims
+//! gets a token: the first proven key is pinned in `hubs.json`, and a freshly
+//! signed `key.<pub>.<sig>.<expiry>.<nonce>` token over that answer's challenge
+//! goes out as the raw `auth`/`v` header block. A hub that doesn't prove its
+//! key, or proves another than the pinned one, gets nothing while the service
+//! keeps trying. Unless disabled, every connect also sends a certificate for
+//! the service key signed by the device key (see [`DeviceKey`]), renewed when
+//! less than a day is left. The wire
 //! contract matches the TS reference: `hub/profile/update`,
 //! `hub/service/update` on every (re)connect, AppInterface + element DSL.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::env;
 use std::fmt;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use channel_rs::*;
 
 mod device;
+mod hub_proof;
 mod keychain;
 mod network;
 pub use device::{
     CERTIFICATE_LIFETIME, CERTIFICATE_RENEW, Certificate, Certifier, DeviceKey, default_device_name,
     device_id, device_mode_enabled, encode_certificate, host_name, platform, safety_code,
 };
+pub use hub_proof::{HubInfo, HubTransport, hub_info_signed_data, hub_transport_of, make_client_nonce};
 pub use keychain::{AUTH_EXPIRY, Keychain, KeychainError, auth_token};
 pub use network::{
     LocalTarget, NetworkPolicy, NetworkShare, Protocol, SharePublication, default_agent_socket,
@@ -47,18 +50,20 @@ use std::sync::Mutex;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const POLL_SLEEP: Duration = Duration::from_millis(1);
+/// Bounds the `hub/info` question before a connect.
+const HUB_INFO_TIMEOUT: Duration = Duration::from_secs(5);
+/// The longest wait between attempts at a hub that doesn't prove its key, or
+/// can't be reached; the wait starts at [`RECONNECT_DELAY`] and doubles.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
-/// The v0 raw header block for the WebSocket upgrade request:
-/// `auth: <fresh token>` + `v: 0` (channel-rs appends the final CRLF itself;
-/// keeping ours makes the block self-contained).
-pub fn auth_header_block(token: &str) -> String {
-    connect_header_block(token, 0, None)
-}
+/// The `v` header next to `auth`.
+pub const AUTH_VERSION: &str = "1";
 
-/// The raw handshake header block: `auth`, `v` (0 or 1) and, when given,
-/// the `device` certificate.
-pub fn connect_header_block(token: &str, version: u8, device: Option<&str>) -> String {
-    let mut block = format!("auth: {token}\r\nv: {version}\r\n");
+/// The raw handshake header block: `auth`, `v` and, when given, the `device`
+/// certificate (channel-rs appends the final CRLF itself; keeping ours makes
+/// the block self-contained).
+pub fn connect_header_block(token: &str, device: Option<&str>) -> String {
+    let mut block = format!("auth: {token}\r\nv: {AUTH_VERSION}\r\n");
     if let Some(device) = device {
         block.push_str(&format!("device: {device}\r\n"));
     }
@@ -85,14 +90,20 @@ pub struct ServiceOptions {
     pub name: Option<String>,
     /// Profile icon: a string or `{"symbol": ..., "text": ...}`.
     pub icon: Option<Value>,
-    /// Optional v0 token factory for hub-server auth, replacing the keychain.
-    /// The returned token is attached as the raw `auth` header on every
-    /// (re)connect; an empty string connects without auth headers. No hub
-    /// key is learned or pinned with a custom factory.
-    pub sign: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    /// Optional token factory for hub-server auth, replacing the keychain's
+    /// signing. It gets the key the hub proved and the challenge of this
+    /// connect, and runs only after that proof. The returned token is attached
+    /// as the raw `auth` header; an empty string connects without auth headers.
+    /// Turns off device mode.
+    pub sign: Option<Arc<dyn Fn(&str, &str) -> String + Send + Sync>>,
     /// The keychain to sign with and keep hub key pins in (default:
     /// [`Keychain::new`], the `auth` file in the cwd or `$HUBKEY`).
     pub keychain: Option<Arc<Keychain>>,
+    /// Dials plain `ws://` beyond loopback, the overlay and the LAN, which
+    /// would carry the key unencrypted: for private networks the SDK can't
+    /// recognize, such as a container's `ws://hub:1997`. Also
+    /// `HUB_ALLOW_PLAINTEXT=1`.
+    pub allow_plaintext: bool,
     /// Instance name in the device certificate, unique per device
     /// (`s3-local/Backup Disk`). Default: `$HUB_INSTANCE`, else `name`, else
     /// the basename of the working directory, else `service`.
@@ -123,6 +134,7 @@ impl fmt::Debug for ServiceOptions {
             .field("icon", &self.icon)
             .field("sign", &self.sign.as_ref().map(|_| "<closure>"))
             .field("keychain", &self.keychain.as_ref().map(|keychain| keychain.path().to_path_buf()))
+            .field("allow_plaintext", &self.allow_plaintext)
             .field("instance", &self.instance)
             .field("device_name", &self.device_name)
             .field("parent", &self.parent)
@@ -141,6 +153,7 @@ impl Clone for ServiceOptions {
             icon: self.icon.clone(),
             sign: self.sign.clone(),
             keychain: self.keychain.clone(),
+            allow_plaintext: self.allow_plaintext,
             instance: self.instance.clone(),
             device_name: self.device_name.clone(),
             parent: self.parent.clone(),
@@ -152,6 +165,14 @@ impl Clone for ServiceOptions {
 }
 
 impl Address {
+    /// How a connection to this address travels (see [`hub_transport_of`]).
+    pub fn transport(&self) -> HubTransport {
+        match self {
+            Address::Port(_) => HubTransport::Loopback,
+            Address::Url(url) => hub_transport_of(url),
+        }
+    }
+
     /// The key of this address's hub key pin (see [`normalize_hub_address`]).
     pub fn pin_address(&self) -> String {
         match self {
@@ -215,7 +236,7 @@ pub struct Profile {
     pub icon: Option<Value>,
 }
 
-/// Pro-only wire-parity permissions; hub-lite ignores it.
+/// Permissions of a registered API path.
 #[derive(Debug, Clone, Serialize)]
 pub struct ServicePermissions {
     /// Auto-filled with the first path segment when empty (TS parity).
@@ -226,7 +247,7 @@ pub struct ServicePermissions {
     pub allows: Option<bool>,
 }
 
-/// Settings for a registered API path (pro-only fields, wire parity).
+/// Settings for a registered API path.
 #[derive(Debug, Clone, Default)]
 pub struct ApiSettings {
     pub permissions: Option<ServicePermissions>,
@@ -550,7 +571,7 @@ pub struct Caller {
 
 impl Caller {
     /// The caller in a request context; `None` when it has no hub caller
-    /// (hub-lite, or a call that didn't come through a hub).
+    /// (a call that didn't come through a hub).
     pub fn from_context(context: &Value) -> Option<Caller> {
         let hub = context.get("hub")?;
         let mut caller: Caller = serde_json::from_value(hub.get("caller")?.clone()).ok()?;
@@ -596,6 +617,9 @@ pub enum ServiceError {
     Channel(String),
     /// Share publishing failed (local agent, attestation or the hub's reply).
     Network(String),
+    /// The address would carry the service's key unencrypted, so it wasn't
+    /// dialed (see [`ServiceOptions::allow_plaintext`]).
+    PlaintextRefused(String),
 }
 
 impl fmt::Display for ServiceError {
@@ -606,6 +630,7 @@ impl fmt::Display for ServiceError {
             ServiceError::Remote(error) => write!(f, "remote error: {error}"),
             ServiceError::Channel(error) => write!(f, "channel error: {error}"),
             ServiceError::Network(error) => write!(f, "network error: {error}"),
+            ServiceError::PlaintextRefused(error) => write!(f, "{error}"),
         }
     }
 }
@@ -662,8 +687,11 @@ enum Command {
 pub struct Service {
     address: Address,
     profile: Option<Profile>,
-    sign: Option<Arc<dyn Fn() -> String + Send + Sync>>,
-    keychain: Option<Arc<Keychain>>,
+    sign: Option<Arc<dyn Fn(&str, &str) -> String + Send + Sync>>,
+    keychain: Arc<Keychain>,
+    allow_plaintext: bool,
+    /// Set when `start` dialed nothing because of the transport.
+    refused: Option<String>,
     instance: Option<String>,
     device_name: Option<String>,
     parent: Option<String>,
@@ -691,11 +719,9 @@ impl Service {
             None
         };
         // Default auth source: the keychain `auth` file in the cwd (TS
-        // parity), generated on first use. A custom `sign` factory replaces it.
-        let keychain = match options.sign {
-            Some(_) => None,
-            None => Some(options.keychain.clone().unwrap_or_else(|| Arc::new(Keychain::new()))),
-        };
+        // parity), generated on first use. A custom `sign` factory replaces its
+        // signing; the hub key pins stay beside its file either way.
+        let keychain = options.keychain.clone().unwrap_or_else(|| Arc::new(Keychain::new()));
         let device_key = match options.disable_device || !device_mode_enabled() {
             true => None,
             false => options.device_key.clone().or_else(|| DeviceKey::new().map(Arc::new)),
@@ -704,6 +730,8 @@ impl Service {
             address,
             sign: options.sign.clone(),
             keychain,
+            allow_plaintext: options.allow_plaintext || env::var("HUB_ALLOW_PLAINTEXT").as_deref() == Ok("1"),
+            refused: None,
             instance: options.instance.clone(),
             device_name: options.device_name.clone(),
             parent: options.parent.clone(),
@@ -871,7 +899,7 @@ impl Service {
     /// it and the hub publishes the whole declared set. On failure the set
     /// is left as it was.
     pub fn publish_share(&self, share: NetworkShare) -> Result<Vec<SharePublication>, ServiceError> {
-        let tx = self.requests.get().ok_or(ServiceError::NotStarted)?;
+        let tx = self.requests()?;
         let (resp, rx) = mpsc::channel();
         tx.send(Command::PublishShare { share, resp })
             .map_err(|_| ServiceError::Disconnected)?;
@@ -880,7 +908,7 @@ impl Service {
 
     /// Removes a share and publishes the remaining set.
     pub fn remove_share(&self, name: &str) -> Result<Vec<SharePublication>, ServiceError> {
-        let tx = self.requests.get().ok_or(ServiceError::NotStarted)?;
+        let tx = self.requests()?;
         let (resp, rx) = mpsc::channel();
         tx.send(Command::RemoveShare {
             name: name.to_string(),
@@ -899,14 +927,27 @@ impl Service {
             .unwrap_or_default()
     }
 
-    /// Forgets the hub key pinned for this service's address. Use it when a
-    /// v1 connect keeps failing with `invalid signature` because the hub's
-    /// key changed on purpose; the next connect learns it again.
+    /// The hub key pinned for this service's address, `None` until a hub
+    /// proved one.
+    pub fn hub_key(&self) -> Option<String> {
+        self.keychain.hub_key(&self.address.pin_address())
+    }
+
+    /// Forgets the hub key pinned for this service's address, for a hub whose
+    /// key changed on purpose. The next connect pins what the hub proves.
     pub fn forget_hub_key(&self) -> Result<(), KeychainError> {
-        match &self.keychain {
-            Some(keychain) => keychain.forget_hub_key(&self.address.pin_address()),
-            None => Ok(()),
-        }
+        self.keychain.forget_hub_key(&self.address.pin_address())
+    }
+
+    /// Why this service's address won't be dialed, if it won't: plain `ws://`
+    /// beyond loopback, the overlay and the LAN, without `allow_plaintext`.
+    pub fn plaintext_refusal(&self) -> Option<String> {
+        (!self.allow_plaintext && self.address.transport() == HubTransport::Refused).then(|| {
+            format!(
+                "{} would carry this service's key unencrypted. Use wss://, or set allow_plaintext (HUB_ALLOW_PLAINTEXT=1) on a private network",
+                self.address.pin_address()
+            )
+        })
     }
 
     /// The profile sent as `hub/profile/update`, if name/icon were set.
@@ -917,8 +958,15 @@ impl Service {
     /// Connects to the hub and spawns the poll thread. On every (re)connect
     /// it sends `hub/profile/update` (if a profile is set) and
     /// `hub/service/update` with the current services+apps. Idempotent.
+    /// A refused address (see [`Service::plaintext_refusal`]) opens nothing, and
+    /// calls fail with why.
     pub fn start(&mut self) -> &mut Self {
         if self.requests.get().is_some() {
+            return self;
+        }
+        self.refused = self.plaintext_refusal();
+        if let Some(refused) = &self.refused {
+            eprintln!("hub-service-rs: {refused}");
             return self;
         }
         let (tx, rx) = mpsc::channel();
@@ -937,7 +985,9 @@ impl Service {
             profile: self.profile.take(),
             sign: self.sign.take(),
             keychain: self.keychain.clone(),
-            hub_key_known: false,
+            retry_delay: RECONNECT_DELAY,
+            next_attempt: Instant::now(),
+            last_failure: String::new(),
             apps: std::mem::take(&mut self.apps),
             paths: std::mem::take(&mut self.paths),
             settings: std::mem::take(&mut self.settings),
@@ -951,9 +1001,18 @@ impl Service {
         self
     }
 
-    /// Calls an API through the hub. Errors if the service is not started.
+    /// The poll thread's queue; an error when it doesn't run.
+    fn requests(&self) -> Result<&mpsc::Sender<Command>, ServiceError> {
+        self.requests.get().ok_or_else(|| match &self.refused {
+            Some(refused) => ServiceError::PlaintextRefused(refused.clone()),
+            None => ServiceError::NotStarted,
+        })
+    }
+
+    /// Calls an API through the hub, waiting for a connection when there is
+    /// none. Errors if the service is not started.
     pub fn send(&self, path: &str, body: Value) -> Result<Value, ServiceError> {
-        let tx = self.requests.get().ok_or(ServiceError::NotStarted)?;
+        let tx = self.requests()?;
         let (rtx, rrx) = mpsc::channel();
         tx.send(Command::Send {
             path: path.to_string(),
@@ -968,9 +1027,10 @@ impl Service {
         }
     }
 
-    /// Opens a stream call through the hub. Errors if not started.
+    /// Opens a stream call through the hub, waiting for a connection when
+    /// there is none. Errors if not started.
     pub fn values(&self, path: &str, body: Value) -> Result<ServiceValues, ServiceError> {
-        let tx = self.requests.get().ok_or(ServiceError::NotStarted)?;
+        let tx = self.requests()?;
         let (rtx, rrx) = mpsc::channel();
         tx.send(Command::Values {
             path: path.to_string(),
@@ -1044,10 +1104,13 @@ impl Drop for ServiceValues {
 struct Core {
     address: Address,
     profile: Option<Profile>,
-    sign: Option<Arc<dyn Fn() -> String + Send + Sync>>,
-    keychain: Option<Arc<Keychain>>,
-    /// The current connection used a pinned hub key (v1).
-    hub_key_known: bool,
+    sign: Option<Arc<dyn Fn(&str, &str) -> String + Send + Sync>>,
+    keychain: Arc<Keychain>,
+    /// The wait after the next failed attempt, and when the next one may run.
+    retry_delay: Duration,
+    next_attempt: Instant,
+    /// The failure last reported: each distinct one is reported once.
+    last_failure: String,
     /// Issues the `device` header; `None` when device mode is off.
     certifier: Option<Certifier>,
     network: Arc<Mutex<NetworkPublisher>>,
@@ -1113,11 +1176,17 @@ impl Core {
         let mut connected = false;
         let mut values: Vec<(u64, Values<Value>)> = Vec::new();
         let mut next_values_id: u64 = 0;
+        // Calls that wait for a connection that registered.
+        let mut waiting: VecDeque<Command> = VecDeque::new();
 
         loop {
             // Serve client calls (send / values) on this thread.
-            while let Ok(command) = self.rx.try_recv() {
+            waiting.extend(self.rx.try_iter());
+            for command in std::mem::take(&mut waiting) {
                 match command {
+                    command @ (Command::Send { .. } | Command::Values { .. }) if !connected => {
+                        waiting.push_back(command);
+                    }
                     Command::Send { path, body, resp } => {
                         let result = match client.as_mut() {
                             Some(client) => client.sender().send::<Value, Value>(&path, body),
@@ -1176,13 +1245,8 @@ impl Core {
                     if !connected {
                         self.send_updates(c);
                         connected = true;
-                        if !self.hub_key_known && self.learn_hub_key(c) {
-                            // Reconnect at once with the hub-bound v1 token.
-                            client = None;
-                            values.clear();
-                            connected = false;
-                            continue;
-                        }
+                        self.retry_delay = RECONNECT_DELAY;
+                        self.last_failure.clear();
                         let republish = self.network.lock().map(|network| network.has_shares()).unwrap_or(false);
                         if republish {
                             if let Err(error) = self.with_shares(Some(c), |network, keychain, send| {
@@ -1200,55 +1264,76 @@ impl Core {
                 client = None;
                 values.clear();
                 connected = false;
-                thread::sleep(RECONNECT_DELAY);
-                continue;
+                self.next_attempt = Instant::now() + RECONNECT_DELAY;
             }
-            if client.is_none() {
-                // Fresh hub-server auth token per connect (expiry changes): the
-                // raw header block is attached to the HTTP upgrade request.
-                let headers = self.connect_headers();
-                let options = ConnectOptions {
-                    headers,
-                    ..ConnectOptions::default()
-                };
-                let result = match &self.address {
-                    Address::Port(port) => channel.connect(*port, options),
-                    Address::Url(url) => channel.connect(url.clone(), options),
-                };
-                match result {
-                    Ok(c) => {
-                        client = Some(c);
-                        connected = false;
-                    }
-                    Err(_) => thread::sleep(RECONNECT_DELAY),
-                }
+            if client.is_none() && Instant::now() >= self.next_attempt {
+                client = self.connect(&channel);
+                connected = false;
             }
             thread::sleep(POLL_SLEEP);
         }
     }
 
-    /// The handshake header block for the next connect: a v1 token when a
-    /// hub key is pinned for the address, else v0.
-    fn connect_headers(&mut self) -> Option<String> {
-        if let Some(sign) = &self.sign {
-            let token = sign();
-            return (!token.is_empty()).then(|| auth_header_block(&token));
-        }
-        let keychain = self.keychain.as_ref()?;
-        let hub_key = keychain.hub_key(&self.address.pin_address());
-        self.hub_key_known = hub_key.is_some();
-        // A keychain failure logs and connects without auth headers rather
-        // than killing the service thread.
-        let token = match keychain.sign_for_hub(hub_key.as_deref(), AUTH_EXPIRY) {
-            Ok(token) => token,
-            Err(error) => {
-                eprintln!("hub-service-rs: keychain error: {error}");
-                return None;
+    /// One connection attempt. A failed one, with no proof from the hub
+    /// included, holds the next one back (doubling up to [`MAX_RETRY_DELAY`]),
+    /// while calls keep waiting.
+    fn connect(&mut self, channel: &Channel<()>) -> Option<Client<()>> {
+        let result = self.handshake().and_then(|headers| {
+            let options = ConnectOptions {
+                headers,
+                ..ConnectOptions::default()
+            };
+            match &self.address {
+                Address::Port(port) => channel.connect(*port, options),
+                Address::Url(url) => channel.connect(url.clone(), options),
             }
-        };
+            .map_err(|error| format!("{}: {error}", self.address.pin_address()))
+        });
+        match result {
+            Ok(client) => Some(client),
+            Err(message) => {
+                if message != self.last_failure {
+                    eprintln!("hub-service-rs: {message}");
+                    self.last_failure = message;
+                }
+                self.next_attempt = Instant::now() + self.retry_delay;
+                self.retry_delay = (self.retry_delay * 2).min(MAX_RETRY_DELAY);
+                None
+            }
+        }
+    }
+
+    /// Runs before every connection attempt (protocol.md section 2): asks the
+    /// hub for its proof and signs a fresh token for that answer alone. The
+    /// result is the handshake header block; an error means nothing goes out.
+    fn handshake(&mut self) -> Result<Option<String>, String> {
+        let address = self.address.pin_address();
+        let info = hub_proof::ask_hub(&self.address, HUB_INFO_TIMEOUT)
+            .map_err(|error| format!("{address}: {error}, sending it nothing"))?;
+        match self.keychain.hub_key(&address) {
+            None => self
+                .keychain
+                .pin_hub_key(&address, &info.key)
+                .map_err(|error| format!("pin hub key: {error}"))?,
+            Some(pinned) if pinned != info.key => {
+                return Err(format!(
+                    "{address} answers with key {}, not the pinned {pinned}, sending it nothing. forget_hub_key if its key really changed",
+                    info.key
+                ));
+            }
+            Some(_) => {}
+        }
+        if let Some(sign) = &self.sign {
+            let token = sign(&info.key, &info.challenge);
+            return Ok((!token.is_empty()).then(|| connect_header_block(&token, None)));
+        }
+        let token = self
+            .keychain
+            .sign_default(&info.key, &info.challenge)
+            .map_err(|error| format!("auth token: {error}"))?;
         // A device key that can't be read or created leaves a plain key
         // connection.
-        let device = match (&mut self.certifier, keychain.public_key(), keychain::now_seconds()) {
+        let device = match (&mut self.certifier, self.keychain.public_key(), keychain::now_seconds()) {
             (Some(certifier), Ok(service_key), Ok(now)) => match certifier.header(&service_key, now) {
                 Ok(header) => Some(header),
                 Err(error) => {
@@ -1258,26 +1343,7 @@ impl Core {
             },
             _ => None,
         };
-        Some(connect_header_block(
-            &token,
-            if hub_key.is_some() { 1 } else { 0 },
-            device.as_deref(),
-        ))
-    }
-
-    /// Asks `hub/info` for the hub key and pins it. True when a key was
-    /// pinned (the caller reconnects with v1); hub-lite answers with an error.
-    fn learn_hub_key(&self, client: &mut Client<()>) -> bool {
-        let Some(keychain) = &self.keychain else {
-            return false;
-        };
-        let Ok(CallResult::Ok(Some(info))) = client.sender().send::<Value, ()>("hub/info", ()) else {
-            return false;
-        };
-        match info.get("key").and_then(Value::as_str) {
-            Some(key) if !key.is_empty() => keychain.pin_hub_key(&self.address.pin_address(), key).is_ok(),
-            _ => false,
-        }
+        Ok(Some(connect_header_block(&token, device.as_deref())))
     }
 
     /// Runs a share operation with the keychain and a `network/shares/replace`
@@ -1292,10 +1358,10 @@ impl Core {
         ) -> Result<Vec<SharePublication>, String>,
     ) -> Result<Vec<SharePublication>, ServiceError> {
         let client = client.ok_or(ServiceError::NotStarted)?;
-        let keychain = self
-            .keychain
-            .as_ref()
-            .ok_or_else(|| ServiceError::Network("share publishing needs the keychain, not a custom sign".into()))?;
+        if self.sign.is_some() {
+            return Err(ServiceError::Network("share publishing needs the keychain, not a custom sign".into()));
+        }
+        let keychain = self.keychain.as_ref();
         let mut network = self
             .network
             .lock()
