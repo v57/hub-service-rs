@@ -6,7 +6,7 @@ license = "MIT"
 description = "Rust port of hub-service: connect to a hub, host post/stream API endpoints, register apps, hub-server auth (ed25519 keychain)."
 
 [dependencies]
-channel-rs = { path = "../../Channel/channel-rs/crates/channel-rs" }
+channel-rs = { git = "https://github.com/v57/channel-rs", rev = "67981adea9e0d3775058bdb062dc5365a880de57" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"

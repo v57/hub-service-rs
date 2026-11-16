@@ -6,4 +6,14 @@ hub_run="$(dirname "$0")/../../../HubTools/hub-run"
 
 cd "$(dirname "$0")/.."
 
-cargo test
+# Next to a Channel checkout, test against it instead of the channel-rs revision Cargo.toml names. The patch
+# rewrites Cargo.lock's channel-rs entries, so the committed lock (the git revision) is put back afterwards.
+channel=../../Channel/channel-rs/crates/channel-rs
+if [[ -d "$channel" ]]; then
+  lock="$(mktemp)"
+  cp Cargo.lock "$lock"
+  trap 'mv "$lock" Cargo.lock' EXIT
+  cargo test --config "patch.\"https://github.com/v57/channel-rs\".channel-rs.path=\"$channel\""
+else
+  cargo test
+fi

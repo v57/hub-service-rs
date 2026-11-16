@@ -96,6 +96,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "channel-rs"
 version = "0.1.0"
+source = "git+https://github.com/v57/channel-rs?rev=67981adea9e0d3775058bdb062dc5365a880de57#67981adea9e0d3775058bdb062dc5365a880de57"
 dependencies = [
  "channel-rs-client",
  "channel-rs-core",
@@ -106,6 +107,7 @@ dependencies = [
 [[package]]
 name = "channel-rs-client"
 version = "0.1.0"
+source = "git+https://github.com/v57/channel-rs?rev=67981adea9e0d3775058bdb062dc5365a880de57#67981adea9e0d3775058bdb062dc5365a880de57"
 dependencies = [
  "anyhow",
  "channel-rs-core",
@@ -123,6 +125,7 @@ dependencies = [
 [[package]]
 name = "channel-rs-core"
 version = "0.1.0"
+source = "git+https://github.com/v57/channel-rs?rev=67981adea9e0d3775058bdb062dc5365a880de57#67981adea9e0d3775058bdb062dc5365a880de57"
 dependencies = [
  "async-stream",
  "base64",
@@ -144,6 +147,7 @@ dependencies = [
 [[package]]
 name = "channel-rs-process"
 version = "0.1.0"
+source = "git+https://github.com/v57/channel-rs?rev=67981adea9e0d3775058bdb062dc5365a880de57#67981adea9e0d3775058bdb062dc5365a880de57"
 dependencies = [
  "channel-rs-core",
  "parking_lot",
@@ -153,6 +157,7 @@ dependencies = [
 [[package]]
 name = "channel-rs-server"
 version = "0.1.0"
+source = "git+https://github.com/v57/channel-rs?rev=67981adea9e0d3775058bdb062dc5365a880de57#67981adea9e0d3775058bdb062dc5365a880de57"
 dependencies = [
  "anyhow",
  "channel-rs-core",

@@ -29,15 +29,18 @@ use), renewed when less than a day of its 7 days is left. The wire contract matc
 cargo add hub-service-rs --git https://github.com/v57/hub-service-rs
 ```
 
-Requires [channel-rs](https://github.com/v57/channel-rs) and a tokio runtime
-(the channel client is driven by a poll thread owned by `Service::start`).
+The crate isn't on crates.io; Cargo takes it from git, with
+[channel-rs](https://github.com/v57/channel-rs) at the revision `Cargo.toml` names. The example below also
+needs `cargo add serde_json` and `cargo add tokio --features macros,rt-multi-thread,time`
+(the channel client is driven by a poll thread owned by `Service::start`). `scripts/test` builds against a
+`../../Channel/channel-rs` checkout when there is one.
 
 ## Usage
 
 Start a hub first (hub-server, listens on 1997), then:
 
 ```rust
-use hub_service_rs::{Action, App, AppHeader, Service, ServiceOptions};
+use hub_service_rs::{Action, App, AppHeader, Service, ServiceOptions, cell, text_field};
 use serde_json::json;
 
 #[tokio::main]
